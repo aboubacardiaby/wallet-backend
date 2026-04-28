@@ -88,6 +88,8 @@ class AddBankRequest(BaseModel):
     bank_name: str
     account_number: str       # full number — last4 extracted, rest discarded
     holder_name: str
+    routing_number: Optional[str] = None
+    account_type: str = "checking"  # "checking" | "savings"
     set_default: bool = False
 
 
@@ -180,6 +182,10 @@ async def add_bank(
         label=_make_label("bank_transfer", "", last4, body.bank_name, ""),
         is_default=body.set_default,
         created_at=datetime.utcnow(),
+        metadata_={
+            "routing_number": body.routing_number,
+            "account_type": body.account_type,
+        },
     )
     db.add(pm)
     await db.commit()

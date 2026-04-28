@@ -1,3 +1,4 @@
+import hashlib
 import os
 import random
 from datetime import datetime, timedelta, timezone
@@ -6,7 +7,7 @@ import bcrypt
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import get_db
@@ -52,6 +53,11 @@ def _generate_otp() -> str:
     return f"{random.randint(0, 999999):06d}"
 
 
+def _hash_otp(code: str) -> str:
+    pepper = os.getenv("OTP_PEPPER", "")
+    return hashlib.sha256(f"{pepper}{code}".encode()).hexdigest()
+
+
 def _generate_token(user_id: str, phone_number: str) -> str:
     jwt_secret = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
     payload = {
@@ -69,20 +75,42 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists")
 
+    # Rate limit: max 3 OTP requests per phone per 10 minutes
+    window = datetime.utcnow() - timedelta(minutes=10)
+    recent_count = await db.scalar(
+        select(func.count()).select_from(OTP).where(
+            OTP.phone_number == req.phone_number,
+            OTP.created_at > window,
+        )
+    )
+    if recent_count >= 3:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many OTP requests. Please wait before trying again.",
+        )
+
+    # Invalidate any existing unverified OTPs for this phone
+    await db.execute(
+        delete(OTP).where(
+            OTP.phone_number == req.phone_number,
+            OTP.verified == False,
+        )
+    )
+
     otp_code = _generate_otp()
     otp = OTP(
         phone_number=req.phone_number,
-        code=otp_code,
+        code=_hash_otp(otp_code),
         purpose="registration",
         expires_at=datetime.utcnow() + timedelta(minutes=5),
     )
     db.add(otp)
     await db.commit()
 
-    # In production, send OTP via SMS (Twilio)
-    print(f"OTP for {req.phone_number}: {otp_code}")
+    # TODO: send OTP via SMS (Twilio) — print only for local dev
+    print(f"[DEV] OTP for {req.phone_number}: {otp_code}")
 
-    return {"message": "OTP sent successfully", "otp": otp_code}  # Remove otp in production
+    return {"message": "OTP sent successfully"}
 
 
 @router.post("/verify-otp")
@@ -90,7 +118,7 @@ async def verify_otp(req: VerifyOTPRequest, db: AsyncSession = Depends(get_db)):
     otp = await db.scalar(
         select(OTP).where(
             OTP.phone_number == req.phone_number,
-            OTP.code == req.code,
+            OTP.code == _hash_otp(req.code),
             OTP.verified == False,
             OTP.expires_at > datetime.utcnow(),
         )
