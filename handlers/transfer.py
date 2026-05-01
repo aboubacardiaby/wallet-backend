@@ -265,14 +265,14 @@ async def send_money(
 
     sender_id = uuid_lib.UUID(token["user_id"])
 
-    recipient = await _find_user_by_phone(req.to_phone, db)
-    if not recipient:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No account found for '{req.to_phone}'. Check the number and try again.",
-        )
-    if recipient.id == sender_id:
-        raise HTTPException(status_code=400, detail="Cannot send money to yourself")
+    # recipient = await _find_user_by_phone(req.to_phone, db)
+    # if not recipient:
+    #     raise HTTPException(
+    #         status_code=404,
+    #         detail=f"No account found for '{req.to_phone}'. Check the number and try again.",
+    #     )
+    # if recipient.id == sender_id:
+    #     raise HTTPException(status_code=400, detail="Cannot send money to yourself")
 
     sender_wallet = await db.scalar(
         select(Wallet).where(Wallet.user_id == sender_id).with_for_update()
