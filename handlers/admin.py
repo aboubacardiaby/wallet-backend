@@ -30,6 +30,7 @@ from models.bank import Bank
 from models.fee_rule import FeeRule
 from models.kyc import KYCSubmission
 from models.rate_override import RateOverride
+from models.ach_config import AchConfig
 from models.smtp_settings import SmtpConfig
 from models.user import User
 from models.wallet import Agent, Transaction, Wallet
@@ -1331,3 +1332,84 @@ async def send_test_email(
         raise HTTPException(400, f"Failed to send email: {e}")
 
     return {"message": f"Test email sent to {body.to}"}
+
+
+# ── ACH Config ────────────────────────────────────────────────────────────────
+
+class AchConfigRequest(BaseModel):
+    api_base_url: str
+    api_key: str = ""
+    platform_account_number: str
+    platform_routing_number: str
+    platform_account_type: str = "CHECKING"
+    platform_account_name: str = "Kalipeh Platform"
+    enabled: bool = False
+
+
+def _ach_to_dict(cfg: AchConfig, mask_key: bool = True) -> dict:
+    return {
+        "api_base_url":            cfg.api_base_url,
+        "api_key":                 "••••••••" if (mask_key and cfg.api_key) else "",
+        "platform_account_number": cfg.platform_account_number,
+        "platform_routing_number": cfg.platform_routing_number,
+        "platform_account_type":   cfg.platform_account_type,
+        "platform_account_name":   cfg.platform_account_name,
+        "enabled":                 cfg.enabled,
+        "updated_at":              cfg.updated_at.isoformat() if cfg.updated_at else None,
+    }
+
+
+async def _get_or_create_ach(db: AsyncSession) -> AchConfig:
+    cfg = await db.scalar(select(AchConfig).where(AchConfig.id == 1))
+    if not cfg:
+        cfg = AchConfig(id=1)
+        db.add(cfg)
+        await db.flush()
+    return cfg
+
+
+@router.get("/ach-config", dependencies=[Depends(require_role("super_admin"))])
+async def get_ach_config(db: AsyncSession = Depends(get_db)):
+    cfg = await _get_or_create_ach(db)
+    return _ach_to_dict(cfg)
+
+
+@router.put("/ach-config", dependencies=[Depends(require_role("super_admin"))])
+async def update_ach_config(
+    body: AchConfigRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    cfg = await _get_or_create_ach(db)
+    cfg.api_base_url            = body.api_base_url.rstrip("/")
+    cfg.platform_account_number = body.platform_account_number
+    cfg.platform_routing_number = body.platform_routing_number
+    cfg.platform_account_type   = body.platform_account_type.upper()
+    cfg.platform_account_name   = body.platform_account_name
+    cfg.enabled                 = body.enabled
+    if body.api_key and body.api_key != "••••••••":
+        cfg.api_key = body.api_key
+    cfg.updated_at = datetime.utcnow()
+    await db.commit()
+    return _ach_to_dict(cfg)
+
+
+@router.post("/ach-config/test", dependencies=[Depends(require_role("super_admin"))])
+async def test_ach_config(db: AsyncSession = Depends(get_db)):
+    """Verify the stored API key can obtain a Bearer token from the ACH sandbox."""
+    import httpx as _httpx
+    cfg = await _get_or_create_ach(db)
+    if not cfg.api_key:
+        raise HTTPException(400, "No API key configured")
+    try:
+        async with _httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{cfg.api_base_url}/auth/token",
+                json={"apiKey": cfg.api_key, "grantType": "client_credentials"},
+            )
+            resp.raise_for_status()
+    except _httpx.HTTPStatusError as exc:
+        raise HTTPException(400, f"ACH auth failed: {exc.response.text}")
+    except Exception as exc:
+        raise HTTPException(400, f"ACH unreachable: {exc}")
+    data = resp.json()["data"]
+    return {"message": "Connection successful", "token_type": data.get("tokenType"), "expires_in": data.get("expiresIn")}

@@ -14,8 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import get_db
 from middleware.auth import verify_token
+from models.ach_config import AchConfig
 from models.payment_method import PaymentMethod
 from models.wallet import Transaction, Wallet
+from services.ach import ACHConfigError, ACHError, AchClientConfig, initiate_credit, initiate_debit
 from utils import row_to_dict
 
 router = APIRouter(tags=["payments"])
@@ -184,6 +186,7 @@ async def add_bank(
         created_at=datetime.utcnow(),
         metadata_={
             "routing_number": body.routing_number,
+            "account_number": body.account_number,
             "account_type": body.account_type,
         },
     )
@@ -339,4 +342,187 @@ async def top_up(
         "currency": wallet.currency,
         "new_balance": float(wallet.balance),
         "transaction_ref": tx.transaction_ref,
+    }
+
+
+# ── ACH schemas ───────────────────────────────────────────────────────────────
+
+class ACHDebitRequest(BaseModel):
+    routing_number: str
+    account_number: str
+    account_type: str = "CHECKING"   # "CHECKING" | "SAVINGS"
+    account_name: str
+    amount: float                    # USD
+
+
+class ACHCreditRequest(BaseModel):
+    routing_number: str
+    account_number: str
+    account_type: str = "CHECKING"
+    account_name: str
+    amount: float                    # USD
+
+
+# ── Shared helper ─────────────────────────────────────────────────────────────
+
+async def _load_ach_config(db: AsyncSession) -> AchClientConfig:
+    cfg = await db.scalar(select(AchConfig).where(AchConfig.id == 1))
+    if not cfg:
+        raise HTTPException(503, "ACH not configured. Set it up in the admin portal.")
+    if not cfg.enabled:
+        raise HTTPException(503, "ACH is disabled. Enable it in the admin portal.")
+    return AchClientConfig(
+        base_url=cfg.api_base_url,
+        api_key=cfg.api_key,
+        platform_account_number=cfg.platform_account_number,
+        platform_routing_number=cfg.platform_routing_number,
+        platform_account_type=cfg.platform_account_type,
+        platform_account_name=cfg.platform_account_name,
+        enabled=cfg.enabled,
+    )
+
+
+# ── ACH endpoints ─────────────────────────────────────────────────────────────
+
+@router.post("/ach/debit", status_code=202)
+async def ach_debit(
+    body: ACHDebitRequest,
+    token: dict = Depends(verify_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Pull funds FROM a bank account INTO the user's wallet (ACH top-up).
+    The sandbox transitions the payment PENDING → PROCESSING → COMPLETED automatically.
+    """
+    if body.amount <= 0:
+        raise HTTPException(400, "Amount must be positive")
+
+    user_id = uuid.UUID(token["user_id"])
+    wallet = await db.scalar(select(Wallet).where(Wallet.user_id == user_id))
+    if not wallet:
+        raise HTTPException(404, "Wallet not found")
+    if wallet.status != "active":
+        raise HTTPException(403, "Wallet is not active")
+
+    cfg = await _load_ach_config(db)
+    tx_ref = str(uuid.uuid4())
+
+    try:
+        result = await initiate_debit(
+            config=cfg,
+            routing_number=body.routing_number,
+            account_number=body.account_number,
+            account_type=body.account_type,
+            account_name=body.account_name,
+            amount=body.amount,
+            reference_id=tx_ref,
+            description=f"Wallet top-up ****{body.account_number[-4:]}",
+        )
+    except (ACHError, ACHConfigError) as exc:
+        raise HTTPException(exc.status_code, str(exc))
+
+    tx = Transaction(
+        transaction_ref=tx_ref,
+        type="ach_debit",
+        status="pending",
+        to_user_id=user_id,
+        to_phone=token["phone_number"],
+        amount=body.amount,
+        fee=0,
+        total_amount=body.amount,
+        currency=wallet.currency,
+        description=f"ACH top-up from ****{body.account_number[-4:]}",
+        extra_data={
+            "ach_payment_id": result.payment_id,
+            "ach_trace_number": result.trace_number,
+            "routing_number": body.routing_number,
+            "account_last4": body.account_number[-4:],
+        },
+    )
+    db.add(tx)
+    await db.commit()
+
+    return {
+        "message": "ACH debit initiated",
+        "transaction_ref": tx_ref,
+        "ach_payment_id": result.payment_id,
+        "ach_trace_number": result.trace_number,
+        "status": result.status,
+        "amount": body.amount,
+        "currency": wallet.currency,
+    }
+
+
+@router.post("/ach/credit", status_code=202)
+async def ach_credit(
+    body: ACHCreditRequest,
+    token: dict = Depends(verify_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Push funds FROM the wallet TO a bank account (ACH payout / withdrawal).
+    Wallet is debited immediately; bank settlement takes 1-5 business days.
+    """
+    if body.amount <= 0:
+        raise HTTPException(400, "Amount must be positive")
+
+    user_id = uuid.UUID(token["user_id"])
+    wallet = await db.scalar(select(Wallet).where(Wallet.user_id == user_id))
+    if not wallet:
+        raise HTTPException(404, "Wallet not found")
+    if wallet.status != "active":
+        raise HTTPException(403, "Wallet is not active")
+    if float(wallet.balance) < body.amount:
+        raise HTTPException(400, "Insufficient wallet balance")
+
+    cfg = await _load_ach_config(db)
+    tx_ref = str(uuid.uuid4())
+
+    try:
+        result = await initiate_credit(
+            config=cfg,
+            routing_number=body.routing_number,
+            account_number=body.account_number,
+            account_type=body.account_type,
+            account_name=body.account_name,
+            amount=body.amount,
+            reference_id=tx_ref,
+            description=f"Wallet payout ****{body.account_number[-4:]}",
+        )
+    except (ACHError, ACHConfigError) as exc:
+        raise HTTPException(exc.status_code, str(exc))
+
+    # Debit wallet immediately — funds are reserved regardless of settlement status.
+    wallet.balance = float(wallet.balance) - body.amount
+
+    tx = Transaction(
+        transaction_ref=tx_ref,
+        type="ach_credit",
+        status="pending",
+        from_user_id=user_id,
+        from_phone=token["phone_number"],
+        amount=body.amount,
+        fee=0,
+        total_amount=body.amount,
+        currency=wallet.currency,
+        description=f"ACH payout to ****{body.account_number[-4:]}",
+        extra_data={
+            "ach_payment_id": result.payment_id,
+            "ach_trace_number": result.trace_number,
+            "routing_number": body.routing_number,
+            "account_last4": body.account_number[-4:],
+        },
+    )
+    db.add(tx)
+    await db.commit()
+
+    return {
+        "message": "ACH payout initiated",
+        "transaction_ref": tx_ref,
+        "ach_payment_id": result.payment_id,
+        "ach_trace_number": result.trace_number,
+        "status": result.status,
+        "amount": body.amount,
+        "currency": wallet.currency,
+        "new_balance": float(wallet.balance),
     }
