@@ -492,9 +492,23 @@ async def list_transactions(
             Transaction.to_phone.ilike(like)
         )
     total = await db.scalar(select(func.count()).select_from(q.subquery()))
-    rows  = await db.scalars(q.offset((page - 1) * limit).limit(limit))
+    rows  = list(await db.scalars(q.offset((page - 1) * limit).limit(limit)))
+
+    # Batch-load sender names
+    sender_ids = {t.from_user_id for t in rows if t.from_user_id}
+    sender_map: dict = {}
+    if sender_ids:
+        users = await db.scalars(select(User).where(User.id.in_(sender_ids)))
+        sender_map = {u.id: u.full_name for u in users}
+
+    def enrich(t):
+        d = row_to_dict(t)
+        d["sender_name"]    = sender_map.get(t.from_user_id) or None
+        d["recipient_name"] = (t.extra_data or {}).get("recipient_name") or None
+        return d
+
     return {
-        "transactions": [row_to_dict(t) for t in rows],
+        "transactions": [enrich(t) for t in rows],
         "total": total,
         "page": page,
         "pages": -(-total // limit),
@@ -595,9 +609,23 @@ async def list_received_transactions(
             Transaction.from_phone.ilike(like)
         )
     total = await db.scalar(select(func.count()).select_from(q.subquery()))
-    rows  = await db.scalars(q.offset((page - 1) * limit).limit(limit))
+    rows  = list(await db.scalars(q.offset((page - 1) * limit).limit(limit)))
+
+    # Batch-load sender names
+    sender_ids = {t.from_user_id for t in rows if t.from_user_id}
+    sender_map: dict = {}
+    if sender_ids:
+        users = await db.scalars(select(User).where(User.id.in_(sender_ids)))
+        sender_map = {u.id: u.full_name for u in users}
+
+    def enrich(t):
+        d = row_to_dict(t)
+        d["sender_name"]    = sender_map.get(t.from_user_id) or None
+        d["recipient_name"] = (t.extra_data or {}).get("recipient_name") or None
+        return d
+
     return {
-        "transactions": [row_to_dict(t) for t in rows],
+        "transactions": [enrich(t) for t in rows],
         "total": total,
         "page": page,
         "pages": -(-total // limit),
