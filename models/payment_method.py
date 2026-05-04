@@ -34,6 +34,8 @@ class PaymentMethod(Base):
     # Bank transfer fields
     bank_name: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
     account_last4: Mapped[str] = mapped_column(String(4), nullable=False, server_default="")
+    routing_number: Mapped[str] = mapped_column(String(20), nullable=False, server_default="")
+    account_type: Mapped[str] = mapped_column(String(20), nullable=False, server_default="")
 
     # PayPal
     email: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
