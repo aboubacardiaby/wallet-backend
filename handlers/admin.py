@@ -1,32 +1,48 @@
 """
 Admin handler — dashboard stats, user/wallet/bank/KYC management, settings.
 All endpoints require a valid admin JWT (is_admin=True claim).
-Admin login issues such a token against env-configured credentials.
+Role-based access: super_admin > manager > compliance | agent_supervisor > viewer
 """
+import asyncio
 import os
+import smtplib
 import uuid as uuid_lib
 from datetime import datetime, timedelta
 from typing import Optional
 
+import bcrypt
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from config.database import get_db
+from config.smtp import resolve_smtp, send_email, smtp_env, _send_sync
 from config.rate_config import (
     calculate_fee, clear_rate_override, get_rate_override,
     load_from_db, refresh_fee_rules, set_rate_override,
 )
-from middleware.auth import verify_admin_token
+from middleware.auth import require_role, verify_admin_token
+from models.admin_user import AdminUser, ROLES
 from models.bank import Bank
 from models.fee_rule import FeeRule
 from models.kyc import KYCSubmission
 from models.rate_override import RateOverride
+from models.smtp_settings import SmtpConfig
 from models.user import User
-from models.wallet import Transaction, Wallet
+from models.wallet import Agent, Transaction, Wallet
 from utils import row_to_dict
+
+
+# ── Password helpers ──────────────────────────────────────────────────────────
+
+def _hash_pw(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+def _check_pw(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode(), hashed.encode())
 
 router = APIRouter(tags=["admin"], prefix="/admin")
 
@@ -98,23 +114,44 @@ class SettingsUpdateRequest(BaseModel):
 # ── Admin login ───────────────────────────────────────────────────────────────
 
 @router.post("/login")
-async def admin_login(body: AdminLoginRequest):
-    """Issue an admin JWT. Credentials come from env vars ADMIN_USERNAME / ADMIN_PASSWORD."""
-    expected_user = os.getenv("ADMIN_USERNAME", "admin")
-    expected_pass = os.getenv("ADMIN_PASSWORD", "admin123")
-
-    if body.username != expected_user or body.password != expected_pass:
-        raise HTTPException(status_code=401, detail="Invalid admin credentials")
-
+async def admin_login(body: AdminLoginRequest, db: AsyncSession = Depends(get_db)):
+    """Issue an admin JWT. Checks DB admin_users first, falls back to env vars."""
     jwt_secret = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
-    payload = {
-        "sub": body.username,
-        "is_admin": True,
-        "iat": datetime.utcnow(),
-        "exp": datetime.utcnow() + timedelta(hours=12),
+    role = "super_admin"
+
+    # Try DB-based admin user first
+    db_user = await db.scalar(
+        select(AdminUser).where(AdminUser.username == body.username, AdminUser.is_active == True)
+    )
+    if db_user:
+        if not _check_pw(body.password, db_user.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid admin credentials")
+        role = db_user.role
+    else:
+        # Env-var fallback (always super_admin)
+        expected_user = os.getenv("ADMIN_USERNAME", "admin")
+        expected_pass = os.getenv("ADMIN_PASSWORD", "admin123")
+        if body.username != expected_user or body.password != expected_pass:
+            raise HTTPException(status_code=401, detail="Invalid admin credentials")
+
+    token = jwt.encode(
+        {
+            "sub":      body.username,
+            "role":     role,
+            "is_admin": True,
+            "iat":      datetime.utcnow(),
+            "exp":      datetime.utcnow() + timedelta(hours=12),
+        },
+        jwt_secret,
+        algorithm="HS256",
+    )
+    return {
+        "access_token": token,
+        "token_type":   "bearer",
+        "role":         role,
+        "username":     body.username,
+        "expires_in":   43200,
     }
-    token = jwt.encode(payload, jwt_secret, algorithm="HS256")
-    return {"access_token": token, "token_type": "bearer", "expires_in": 43200}
 
 
 # ── Dashboard stats ───────────────────────────────────────────────────────────
@@ -463,6 +500,109 @@ async def list_transactions(
     }
 
 
+# ── Cash Pickup Processing ────────────────────────────────────────────────────
+
+class CashPickupActionRequest(BaseModel):
+    action: str           # assign | confirm | cancel
+    agent_id: Optional[str] = None
+    admin_notes: Optional[str] = None
+
+
+@router.put("/transactions/{tx_id}/cash-pickup")
+async def process_cash_pickup(
+    tx_id: str,
+    body: CashPickupActionRequest,
+    token: dict = Depends(verify_admin_token),
+    db: AsyncSession = Depends(get_db),
+):
+    tx = await db.scalar(select(Transaction).where(Transaction.id == uuid_lib.UUID(tx_id)))
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if tx.type != "cash_pickup":
+        raise HTTPException(status_code=400, detail="Transaction is not a cash pickup")
+
+    extra = tx.extra_data or {}
+
+    if body.action == "assign":
+        if not body.agent_id:
+            raise HTTPException(status_code=400, detail="agent_id is required for assign action")
+        agent = await db.scalar(select(Agent).where(Agent.id == uuid_lib.UUID(body.agent_id)))
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        tx.agent_id = agent.id
+        tx.status   = "ready_for_pickup"
+        tx.extra_data = {
+            **extra,
+            "agent_id":      str(agent.id),
+            "agent_name":    agent.business_name,
+            "agent_phone":   agent.phone_number,
+            "agent_address": agent.address,
+            "agent_country": agent.country,
+            "admin_notes":   body.admin_notes or extra.get("admin_notes"),
+        }
+
+    elif body.action == "confirm":
+        if tx.status != "ready_for_pickup":
+            raise HTTPException(status_code=400, detail="Transaction must be ready_for_pickup to confirm")
+        tx.status = "picked_up"
+        tx.completed_at = datetime.utcnow()
+        tx.extra_data = {**extra, "admin_notes": body.admin_notes or extra.get("admin_notes")}
+
+    elif body.action == "cancel":
+        tx.status = "cancelled"
+        tx.extra_data = {**extra, "admin_notes": body.admin_notes or extra.get("admin_notes")}
+
+    else:
+        raise HTTPException(status_code=400, detail="action must be assign, confirm, or cancel")
+
+    flag_modified(tx, "extra_data")  # tell SQLAlchemy the JSONB field changed
+    await db.commit()
+    return {"message": f"Cash pickup {body.action}ed", "transaction": row_to_dict(tx)}
+
+
+# ── Received Transactions ─────────────────────────────────────────────────────
+
+@router.get("/received-trans")
+async def list_received_transactions(
+    search: Optional[str] = Query(None, description="Filter by phone or ref"),
+    tx_status: Optional[str] = Query(None, alias="status"),
+    delivery_type: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    token: dict = Depends(verify_admin_token),
+    db: AsyncSession = Depends(get_db),
+):
+    # Include cash_pickup transactions (no to_user_id) and regular received transactions
+    q = (
+        select(Transaction)
+        .where(
+            Transaction.to_user_id.isnot(None) |
+            (Transaction.type == "cash_pickup")
+        )
+        .order_by(Transaction.created_at.desc())
+    )
+    if tx_status:
+        q = q.where(Transaction.status == tx_status)
+    if delivery_type:
+        q = q.where(Transaction.type == delivery_type)
+    if search:
+        like = f"%{search}%"
+        q = q.where(
+            Transaction.transaction_ref.ilike(like) |
+            Transaction.to_phone.ilike(like) |
+            Transaction.from_phone.ilike(like)
+        )
+    total = await db.scalar(select(func.count()).select_from(q.subquery()))
+    rows  = await db.scalars(q.offset((page - 1) * limit).limit(limit))
+    return {
+        "transactions": [row_to_dict(t) for t in rows],
+        "total": total,
+        "page": page,
+        "pages": -(-total // limit),
+    }
+
+
 # ── KYC (admin) ───────────────────────────────────────────────────────────────
 
 @router.get("/kyc")
@@ -498,7 +638,7 @@ async def get_settings(token: dict = Depends(verify_admin_token)):
 @router.put("/settings")
 async def update_settings(
     body: SettingsUpdateRequest,
-    token: dict = Depends(verify_admin_token),
+    token: dict = Depends(require_role("super_admin")),
 ):
     for field, value in body.model_dump(exclude_none=True).items():
         if field in _settings:
@@ -785,3 +925,409 @@ async def _reload_fee_rules(db: AsyncSession) -> None:
     """Refresh the in-memory fee rule cache from DB."""
     rows = await db.scalars(select(FeeRule))
     refresh_fee_rules([row_to_dict(r) for r in rows])
+
+
+# ── Admin user management (super_admin only) ─────────────────────────────────
+
+class AdminUserCreateRequest(BaseModel):
+    username: str
+    password: str
+    email:    Optional[str] = None
+    role:     str = "viewer"
+
+class AdminUserUpdateRequest(BaseModel):
+    email:     Optional[str] = None
+    role:      Optional[str] = None
+    is_active: Optional[bool] = None
+
+class AdminPasswordChangeRequest(BaseModel):
+    new_password: str
+
+
+def _admin_user_dict(u: AdminUser) -> dict:
+    return {
+        "id":         str(u.id),
+        "username":   u.username,
+        "email":      u.email,
+        "role":       u.role,
+        "is_active":  u.is_active,
+        "created_at": u.created_at.isoformat() if u.created_at else None,
+        "updated_at": u.updated_at.isoformat() if u.updated_at else None,
+    }
+
+
+@router.get("/admin-users", dependencies=[Depends(require_role("super_admin"))])
+async def list_admin_users(db: AsyncSession = Depends(get_db)):
+    rows = await db.scalars(select(AdminUser).order_by(AdminUser.created_at))
+    return {"admin_users": [_admin_user_dict(u) for u in rows]}
+
+
+@router.post("/admin-users", status_code=status.HTTP_201_CREATED,
+             dependencies=[Depends(require_role("super_admin"))])
+async def create_admin_user(
+    body: AdminUserCreateRequest,
+    token: dict = Depends(require_role("super_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    if body.role not in ROLES:
+        raise HTTPException(400, f"role must be one of: {', '.join(ROLES)}")
+    existing = await db.scalar(select(AdminUser).where(AdminUser.username == body.username))
+    if existing:
+        raise HTTPException(400, "Username already exists")
+
+    creator = await db.scalar(select(AdminUser).where(AdminUser.username == token["sub"]))
+    now = datetime.utcnow()
+    user = AdminUser(
+        username=body.username,
+        email=body.email,
+        password_hash=_hash_pw(body.password),
+        role=body.role,
+        is_active=True,
+        created_by=creator.id if creator else None,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return {"message": "Admin user created", "admin_user": _admin_user_dict(user)}
+
+
+@router.put("/admin-users/{user_id}", dependencies=[Depends(require_role("super_admin"))])
+async def update_admin_user(
+    user_id: str,
+    body: AdminUserUpdateRequest,
+    token: dict = Depends(require_role("super_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await db.scalar(select(AdminUser).where(AdminUser.id == uuid_lib.UUID(user_id)))
+    if not user:
+        raise HTTPException(404, "Admin user not found")
+    if user.username == token["sub"]:
+        raise HTTPException(400, "Cannot modify your own account via this endpoint")
+    if body.role is not None:
+        if body.role not in ROLES:
+            raise HTTPException(400, f"role must be one of: {', '.join(ROLES)}")
+        user.role = body.role
+    if body.email is not None:
+        user.email = body.email
+    if body.is_active is not None:
+        user.is_active = body.is_active
+    user.updated_at = datetime.utcnow()
+    await db.commit()
+    return {"message": "Admin user updated", "admin_user": _admin_user_dict(user)}
+
+
+@router.put("/admin-users/{user_id}/password",
+            dependencies=[Depends(require_role("super_admin"))])
+async def change_admin_password(
+    user_id: str,
+    body: AdminPasswordChangeRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    user = await db.scalar(select(AdminUser).where(AdminUser.id == uuid_lib.UUID(user_id)))
+    if not user:
+        raise HTTPException(404, "Admin user not found")
+    user.password_hash = _hash_pw(body.new_password)
+    user.updated_at    = datetime.utcnow()
+    await db.commit()
+    return {"message": "Password updated"}
+
+
+@router.delete("/admin-users/{user_id}",
+               dependencies=[Depends(require_role("super_admin"))])
+async def delete_admin_user(
+    user_id: str,
+    token: dict = Depends(require_role("super_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await db.scalar(select(AdminUser).where(AdminUser.id == uuid_lib.UUID(user_id)))
+    if not user:
+        raise HTTPException(404, "Admin user not found")
+    if user.username == token["sub"]:
+        raise HTTPException(400, "Cannot delete your own account")
+    await db.delete(user)
+    await db.commit()
+    return {"message": "Admin user deleted"}
+
+
+# ── Agent schemas ─────────────────────────────────────────────────────────────
+
+class AgentRequest(BaseModel):
+    business_name: str
+    phone_number: str
+    address: str = ""
+    country: str = ""
+    latitude: float = 0.0
+    longitude: float = 0.0
+    cash_in_limit: float = 0.0
+    cash_out_limit: float = 0.0
+    commission: float = 0.0
+    user_id: Optional[str] = None
+
+
+class AgentStatusRequest(BaseModel):
+    status: str  # active | inactive | suspended
+
+
+# ── Agents management ─────────────────────────────────────────────────────────
+
+@router.get("/agents")
+async def list_agents(
+    search: Optional[str] = Query(None, description="Filter by business name or phone"),
+    country: Optional[str] = Query(None),
+    agent_status: Optional[str] = Query(None, alias="status"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    token: dict = Depends(verify_admin_token),
+    db: AsyncSession = Depends(get_db),
+):
+    q = select(Agent).order_by(Agent.created_at.desc())
+    if search:
+        like = f"%{search}%"
+        q = q.where(
+            Agent.business_name.ilike(like) | Agent.phone_number.ilike(like)
+        )
+    if country:
+        q = q.where(Agent.country.ilike(f"%{country}%"))
+    if agent_status:
+        q = q.where(Agent.status == agent_status)
+
+    total = await db.scalar(select(func.count()).select_from(q.subquery()))
+    rows  = await db.scalars(q.offset((page - 1) * limit).limit(limit))
+    return {
+        "agents": [row_to_dict(a) for a in rows],
+        "total": total,
+        "page": page,
+        "pages": -(-total // limit),
+    }
+
+
+@router.post("/agents", status_code=status.HTTP_201_CREATED)
+async def create_agent(
+    body: AgentRequest,
+    token: dict = Depends(verify_admin_token),
+    db: AsyncSession = Depends(get_db),
+):
+    user_id = uuid_lib.UUID(body.user_id) if body.user_id else None
+    if user_id:
+        user = await db.scalar(select(User).where(User.id == user_id))
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+    now = datetime.utcnow()
+    agent = Agent(
+        user_id=user_id,
+        business_name=body.business_name,
+        phone_number=body.phone_number,
+        address=body.address,
+        country=body.country,
+        latitude=body.latitude,
+        longitude=body.longitude,
+        cash_in_limit=body.cash_in_limit,
+        cash_out_limit=body.cash_out_limit,
+        commission=body.commission,
+        status="active",
+        is_active=True,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(agent)
+    await db.commit()
+    await db.refresh(agent)
+    return {"message": "Agent created", "agent": row_to_dict(agent)}
+
+
+@router.put("/agents/{agent_id}")
+async def update_agent(
+    agent_id: str,
+    body: AgentRequest,
+    token: dict = Depends(verify_admin_token),
+    db: AsyncSession = Depends(get_db),
+):
+    agent = await db.scalar(select(Agent).where(Agent.id == uuid_lib.UUID(agent_id)))
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    if body.user_id is not None:
+        user_id = uuid_lib.UUID(body.user_id)
+        user = await db.scalar(select(User).where(User.id == user_id))
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        agent.user_id = user_id
+
+    agent.business_name = body.business_name
+    agent.phone_number  = body.phone_number
+    agent.address       = body.address
+    agent.country       = body.country
+    agent.latitude      = body.latitude
+    agent.longitude     = body.longitude
+    agent.cash_in_limit  = body.cash_in_limit
+    agent.cash_out_limit = body.cash_out_limit
+    agent.commission    = body.commission
+    agent.updated_at    = datetime.utcnow()
+    await db.commit()
+    return {"message": "Agent updated", "agent": row_to_dict(agent)}
+
+
+@router.put("/agents/{agent_id}/status")
+async def toggle_agent_status(
+    agent_id: str,
+    body: AgentStatusRequest,
+    token: dict = Depends(verify_admin_token),
+    db: AsyncSession = Depends(get_db),
+):
+    if body.status not in ("active", "inactive", "suspended"):
+        raise HTTPException(status_code=400, detail="status must be active, inactive, or suspended")
+
+    agent = await db.scalar(select(Agent).where(Agent.id == uuid_lib.UUID(agent_id)))
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    agent.status    = body.status
+    agent.is_active = body.status == "active"
+    agent.updated_at = datetime.utcnow()
+    await db.commit()
+    return {"message": "Agent status updated", "agent_id": agent_id, "status": body.status}
+
+
+@router.delete("/agents/{agent_id}")
+async def delete_agent(
+    agent_id: str,
+    token: dict = Depends(verify_admin_token),
+    db: AsyncSession = Depends(get_db),
+):
+    agent = await db.scalar(select(Agent).where(Agent.id == uuid_lib.UUID(agent_id)))
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    await db.delete(agent)
+    await db.commit()
+    return {"message": "Agent deleted"}
+
+
+# ── SMTP / Email settings ─────────────────────────────────────────────────────
+
+class SmtpSettingsRequest(BaseModel):
+    host:       str
+    port:       int  = 587
+    username:   str  = ""
+    password:   str  = ""    # empty string = keep existing password
+    from_email: str  = ""
+    from_name:  str  = "Kalipeh"
+    use_tls:    bool = True
+    use_ssl:    bool = False
+    enabled:    bool = False
+
+class SmtpTestRequest(BaseModel):
+    to: str   # recipient address for the test email
+
+
+def _smtp_to_dict(cfg: SmtpConfig, mask_password: bool = True) -> dict:
+    return {
+        "host":       cfg.host,
+        "port":       cfg.port,
+        "username":   cfg.username,
+        "password":   "••••••••" if (mask_password and cfg.password) else "",
+        "from_email": cfg.from_email,
+        "from_name":  cfg.from_name,
+        "use_tls":    cfg.use_tls,
+        "use_ssl":    cfg.use_ssl,
+        "enabled":    cfg.enabled,
+        "updated_at": cfg.updated_at.isoformat() if cfg.updated_at else None,
+    }
+
+
+async def _get_or_create_smtp(db: AsyncSession) -> SmtpConfig:
+    cfg = await db.scalar(select(SmtpConfig).where(SmtpConfig.id == 1))
+    if not cfg:
+        cfg = SmtpConfig(id=1)
+        db.add(cfg)
+        await db.commit()
+        await db.refresh(cfg)
+    return cfg
+
+
+@router.get("/smtp-settings", dependencies=[Depends(require_role("super_admin"))])
+async def get_smtp_settings(db: AsyncSession = Depends(get_db)):
+    env = smtp_env()
+    if env:
+        result = dict(env)
+        result["password"] = "••••••••" if result["password"] else ""
+        result["updated_at"] = None
+        result["source"] = "env"
+        return result
+    cfg = await _get_or_create_smtp(db)
+    result = _smtp_to_dict(cfg, mask_password=True)
+    result["source"] = "database"
+    return result
+
+
+@router.put("/smtp-settings", dependencies=[Depends(require_role("super_admin"))])
+async def update_smtp_settings(
+    body: SmtpSettingsRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    cfg = await _get_or_create_smtp(db)
+    cfg.host       = body.host.strip()
+    cfg.port       = body.port
+    cfg.username   = body.username.strip()
+    cfg.from_email = body.from_email.strip()
+    cfg.from_name  = body.from_name.strip()
+    cfg.use_tls    = body.use_tls
+    cfg.use_ssl    = body.use_ssl
+    cfg.enabled    = body.enabled
+    cfg.updated_at = datetime.utcnow()
+    if body.password and body.password != "••••••••":
+        cfg.password = body.password
+    await db.commit()
+    return _smtp_to_dict(cfg, mask_password=True)
+
+
+@router.post("/smtp-settings/test", dependencies=[Depends(require_role("super_admin"))])
+async def send_test_email(
+    body: SmtpTestRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    smtp = await resolve_smtp(db)
+    if not smtp.get("host") or not smtp.get("from_email"):
+        raise HTTPException(
+            400,
+            "SMTP not configured. Set SMTP_HOST / SMTP_FROM_EMAIL in .env, "
+            "or save settings via PUT /admin/smtp-settings.",
+        )
+
+    html = f"""
+    <div style="font-family:sans-serif;max-width:480px;margin:40px auto;padding:32px;
+                border:1px solid #e5e7eb;border-radius:12px;">
+      <h2 style="color:#4f46e5;margin-top:0;">Test Email</h2>
+      <p>This is a test email sent from the <strong>Kalipeh Admin Panel</strong>.</p>
+      <p>If you received this, your SMTP configuration is working correctly.</p>
+      <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
+      <p style="color:#6b7280;font-size:13px;">
+        Sent via {smtp["host"]}:{smtp["port"]} &middot;
+        {smtp["from_name"]} &lt;{smtp["from_email"]}&gt;
+      </p>
+    </div>
+    """
+
+    try:
+        await asyncio.to_thread(
+            _send_sync,
+            smtp["host"], smtp["port"], smtp.get("username", ""), smtp.get("password", ""),
+            smtp["from_email"], smtp.get("from_name", ""), smtp.get("use_tls", True), smtp.get("use_ssl", False),
+            body.to, "Test Email — Kalipeh Admin", html,
+        )
+    except smtplib.SMTPAuthenticationError:
+        raise HTTPException(400, "SMTP authentication failed — check username and password")
+    except smtplib.SMTPConnectError:
+        raise HTTPException(400, f"Could not connect to {smtp['host']}:{smtp['port']}")
+    except smtplib.SMTPRecipientsRefused:
+        raise HTTPException(400, f"Recipient address rejected by server: {body.to}")
+    except smtplib.SMTPException as e:
+        raise HTTPException(400, f"SMTP error: {e}")
+    except OSError as e:
+        raise HTTPException(400, f"Network error — check SMTP host/port: {e}")
+    except Exception as e:
+        raise HTTPException(400, f"Failed to send email: {e}")
+
+    return {"message": f"Test email sent to {body.to}"}

@@ -2,6 +2,7 @@
 Transfer handler — supports both same-currency and cross-currency remittance.
 Sender (diaspora, e.g. USD/EUR) → Receiver (Africa, e.g. XOF/NGN).
 """
+import os
 import random
 import re
 import uuid as uuid_lib
@@ -10,6 +11,8 @@ from datetime import datetime, timedelta
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
+from typing import Optional
+
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,10 +67,16 @@ WAVE_COUNTRIES = {"Senegal", "Côte d'Ivoire", "Mali", "Burkina Faso", "Guinea",
 # ── Phone helpers ────────────────────────────────────────────────────────────
 
 def _normalise_phone(raw: str) -> str:
-    digits_only = re.sub(r"[\s\-().]+", "", raw)
-    if digits_only and not digits_only.startswith("+"):
-        digits_only = "+" + digits_only
-    return digits_only
+    cleaned = re.sub(r"[\s\-().]+", "", raw)
+    if cleaned and not cleaned.startswith("+"):
+        cleaned = "+" + cleaned
+    # Require E.164: + followed by 7–15 digits
+    if not re.fullmatch(r"\+\d{7,15}", cleaned):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid phone number '{raw}'. Use E.164 format, e.g. +221778689865.",
+        )
+    return cleaned
 
 
 async def _find_user_by_phone(phone_raw: str, db: AsyncSession):
@@ -169,12 +178,15 @@ class WaveTransferRequest(BaseModel):
     amount: float          # in sender's currency
     recv_currency: str     # destination currency (XOF, XAF, GMD, etc.)
     description: str = ""
+    recipient_name: Optional[str] = None  # sender-supplied name for unregistered recipients
 
 
 class SendMoneyRequest(BaseModel):
     to_phone: str
-    amount: float           # in sender's currency
+    amount: float                          # in sender's currency
     description: str = ""
+    recv_currency: Optional[str] = None   # destination currency hint (informational; wallet currency takes precedence)
+    payment_method_id: Optional[str] = None  # reserved for future card-funded transfers
 
 
 class RequestMoneyRequest(BaseModel):
@@ -319,11 +331,13 @@ async def send_money(
         description=req.description,
         completed_at=now,
         extra_data={
+            "send_amount": req.amount,
             "send_currency": send_ccy,
             "recv_currency": recv_ccy,
             "exchange_rate": rate,
             "net_send_amount": net_send,
             "received_amount": received,
+            "recipient_name": recipient.full_name or req.to_phone,
         },
     )
     db.add(tx)
@@ -338,6 +352,8 @@ async def send_money(
         "exchange_rate": rate,
         "received_amount": received,
         "recv_currency": recv_ccy,
+        "recipient_name": recipient.full_name or req.to_phone,
+        "to_phone": _normalise_phone(req.to_phone),
     }
 
 
@@ -400,21 +416,47 @@ async def check_wave_user(
     """
     Check whether a phone number is registered on Wave mobile money.
 
-    In production this calls the Wave Merchant API:
+    Calls the Wave Merchant API when WAVE_API_KEY is set:
         GET https://api.wave.com/v1/check-user?mobile={phone}
         Authorization: Bearer {WAVE_API_KEY}
 
-    Here we simulate: any phone in a Wave-operating country returns has_wave=True.
+    Falls back to simulation (country-based) when no key is configured.
     """
     normalised = _normalise_phone(phone)
-    # Simulate Wave API lookup
-    # Production: async with httpx.AsyncClient(...) as c: resp = await c.get(...)
+    wave_api_key = os.getenv("WAVE_API_KEY", "")
+
+    if wave_api_key:
+        try:
+            async with httpx.AsyncClient(
+                headers={"Authorization": f"Bearer {wave_api_key}"},
+                timeout=10,
+            ) as client:
+                resp = await client.get(
+                    f"https://api.wave.com/v1/check-user",
+                    params={"mobile": normalised},
+                )
+                if resp.status_code == 404:
+                    return {"phone": normalised, "has_wave": False, "country": country, "wave_name": None}
+                resp.raise_for_status()
+                data = resp.json()
+                return {
+                    "phone": normalised,
+                    "has_wave": True,
+                    "country": country,
+                    "wave_name": data.get("name"),
+                }
+        except httpx.HTTPStatusError:
+            return {"phone": normalised, "has_wave": False, "country": country, "wave_name": None}
+        except Exception:
+            raise HTTPException(status_code=503, detail="Wave API unreachable — cannot verify recipient.")
+
+    # Simulation: any Wave-operating country is treated as registered
     has_wave = bool(country and country in WAVE_COUNTRIES)
     return {
         "phone": normalised,
         "has_wave": has_wave,
         "country": country,
-        "wave_name": None,   # Wave API returns the registered display name
+        "wave_name": None,
     }
 
 
@@ -477,6 +519,14 @@ async def cash_pickup(
         rate = await _get_rate(send_ccy, recv_ccy)
         received = round(net_send * rate, 2)
 
+    # Resolve recipient name: DB lookup → frontend-supplied name → phone fallback
+    cash_recipient = await _find_user_by_phone(req.to_phone, db)
+    resolved_recipient_name = (
+        cash_recipient.full_name
+        if cash_recipient and cash_recipient.full_name
+        else (req.recipient_name or _normalise_phone(req.to_phone))
+    )
+
     # Generate 6-digit pickup PIN
     pickup_code = f"{random.randint(0, 999999):06d}"
 
@@ -497,10 +547,11 @@ async def cash_pickup(
         fee=fee,
         total_amount=req.amount,
         currency=send_ccy,
-        description=req.description or f"Cash pickup for {req.recipient_name}",
+        description=req.description or f"Cash pickup for {resolved_recipient_name or req.to_phone}",
         extra_data={
+            "send_amount": req.amount,
             "pickup_code": pickup_code,
-            "recipient_name": req.recipient_name,
+            "recipient_name": resolved_recipient_name,
             "recv_currency": recv_ccy,
             "exchange_rate": rate,
             "received_amount": received,
@@ -526,7 +577,7 @@ async def cash_pickup(
         "exchange_rate": rate,
         "received_amount": received,
         "recv_currency": recv_ccy,
-        "recipient_name": req.recipient_name,
+        "recipient_name": resolved_recipient_name,
         "agent": agent,
     }
 
@@ -540,8 +591,9 @@ async def wave_transfer(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Send money to a Wave mobile money account (B2C).
-    Debits sender wallet, calls Wave API (simulated), creates Transaction.
+    Queue a Wave mobile money transfer.
+    Debits the sender wallet immediately and saves the transaction as 'pending'.
+    The Wave B2C API call is handled by the processor service.
     """
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
@@ -572,18 +624,15 @@ async def wave_transfer(
         rate = await _get_rate(send_ccy, recv_ccy)
         received = round(net_send * rate, 2)
 
-    # ── Wave B2C API call (simulated — replace with real credentials) ──────────
-    # Production example:
-    #   async with httpx.AsyncClient(headers={"Authorization": f"Bearer {WAVE_API_KEY}"}) as client:
-    #       resp = await client.post(
-    #           "https://api.wave.com/v1/b2c/payment",
-    #           json={"currency": recv_ccy, "receive_amount": str(received),
-    #                 "mobile": _normalise_phone(req.to_phone), "name": req.description},
-    #       )
-    #       resp.raise_for_status()
-    #       wave_data = resp.json()
-    #       wave_ref = wave_data["id"]
-    wave_ref = f"WAVE-{uuid_lib.uuid4().hex[:16].upper()}"
+    recipient_phone = _normalise_phone(req.to_phone)
+
+    # Resolve name: registered full_name → sender-supplied name → phone fallback
+    wave_recipient = await _find_user_by_phone(req.to_phone, db)
+    wave_recipient_name = (
+        wave_recipient.full_name
+        if wave_recipient and wave_recipient.full_name
+        else (req.recipient_name.strip() if req.recipient_name and req.recipient_name.strip() else recipient_phone)
+    )
 
     # Debit sender wallet
     sender_wallet.balance       = float(sender_wallet.balance) - req.amount
@@ -591,41 +640,41 @@ async def wave_transfer(
     sender_wallet.monthly_spent = float(sender_wallet.monthly_spent) + req.amount
     sender_wallet.updated_at    = datetime.utcnow()
 
-    now = datetime.utcnow()
     tx = Transaction(
         transaction_ref=str(uuid_lib.uuid4()),
         type="wave_transfer",
-        status="completed",
+        status="pending",
         from_user_id=sender_id,
         from_phone=token["phone_number"],
-        to_phone=_normalise_phone(req.to_phone),
+        to_phone=recipient_phone,
         amount=req.amount,
         fee=fee,
         total_amount=req.amount,
         currency=send_ccy,
-        description=req.description or f"Wave transfer to {req.to_phone}",
-        completed_at=now,
+        description=req.description or f"Wave transfer to {recipient_phone}",
         extra_data={
-            "wave_ref": wave_ref,
-            "wave_phone": _normalise_phone(req.to_phone),
+            "send_amount": req.amount,
+            "wave_phone": recipient_phone,
             "send_currency": send_ccy,
             "recv_currency": recv_ccy,
             "exchange_rate": rate,
             "net_send_amount": net_send,
             "received_amount": received,
+            "recipient_name": wave_recipient_name,
         },
     )
     db.add(tx)
     await db.commit()
 
     return {
-        "message": "Wave transfer successful",
+        "message": "Wave transfer queued",
         "transaction_ref": tx.transaction_ref,
-        "wave_ref": wave_ref,
         "send_amount": req.amount,
         "send_currency": send_ccy,
         "fee": fee,
         "exchange_rate": rate,
         "received_amount": received,
         "recv_currency": recv_ccy,
+        "recipient_name": wave_recipient_name,
+        "to_phone": recipient_phone,
     }

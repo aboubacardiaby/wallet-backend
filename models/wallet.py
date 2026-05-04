@@ -35,15 +35,17 @@ class Agent(Base):
     __tablename__ = "agents"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True, index=True,
     )
     business_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    latitude: Mapped[float] = mapped_column(Float, nullable=False)
-    longitude: Mapped[float] = mapped_column(Float, nullable=False)
-    address: Mapped[str] = mapped_column(String(500), server_default="")
     phone_number: Mapped[str] = mapped_column(String(20), nullable=False)
+    address: Mapped[str] = mapped_column(String(500), server_default="")
+    country: Mapped[str] = mapped_column(String(100), server_default="")
+    latitude: Mapped[float] = mapped_column(Float, server_default="0")
+    longitude: Mapped[float] = mapped_column(Float, server_default="0")
+    status: Mapped[str] = mapped_column(String(20), server_default="active")
     is_active: Mapped[bool] = mapped_column(Boolean, server_default="true")
     rating: Mapped[float] = mapped_column(Float, server_default="0")
     total_ratings: Mapped[int] = mapped_column(Integer, server_default="0")
