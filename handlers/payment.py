@@ -52,11 +52,12 @@ def _detect_brand(number: str) -> str:
     return "unknown"
 
 
-def _make_label(pm_type: str, brand: str, last4: str, bank_name: str, email: str) -> str:
+def _make_label(pm_type: str, brand: str, last4: str, bank_name: str, email: str, account_type: str = "") -> str:
     if pm_type == "card":
         return f"{brand.capitalize()} •••• {last4}"
     if pm_type == "bank_transfer":
-        return f"{bank_name or 'Bank'} •••• {last4}"
+        suffix = f" {account_type.capitalize()}" if account_type else ""
+        return f"{bank_name or 'Bank'}{suffix} •••• {last4}"
     if pm_type == "paypal":
         return f"PayPal ({email})"
     if pm_type == "apple_pay":
@@ -86,8 +87,10 @@ class AddCardRequest(BaseModel):
 
 class AddBankRequest(BaseModel):
     bank_name: str
-    account_number: str       # full number — last4 extracted, rest discarded
     holder_name: str
+    routing_number: str
+    account_number: str       # full number — last4 extracted, rest discarded
+    account_type: str         # "checking" | "savings"
     set_default: bool = False
 
 
@@ -177,9 +180,18 @@ async def add_bank(
         bank_name=body.bank_name,
         account_last4=last4,
         holder_name=body.holder_name,
-        label=_make_label("bank_transfer", "", last4, body.bank_name, ""),
+        routing_number=body.routing_number,
+        account_type=body.account_type,
+        label=_make_label("bank_transfer", "", last4, body.bank_name, "", body.account_type),
         is_default=body.set_default,
         created_at=datetime.utcnow(),
+        metadata_={
+            "bank_name":      body.bank_name,
+            "holder_name":    body.holder_name,
+            "routing_number": body.routing_number,
+            "account_last4":  last4,
+            "account_type":   body.account_type,
+        },
     )
     db.add(pm)
     await db.commit()
