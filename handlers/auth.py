@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import random
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
@@ -99,38 +100,23 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists")
 
-    try:
-        verification_sid = await send_verification(phone)
-    except VerifyError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-
+    otp_code = _generate_otp()
     otp = OTP(
         phone_number=phone,
-        code=verification_sid,
+        code=_hash_otp(otp_code),
         purpose="registration",
         expires_at=datetime.utcnow() + timedelta(minutes=10),
     )
     db.add(otp)
     await db.commit()
 
-    _send_otp_sms(req.phone_number, otp_code)
+    _send_otp_sms(phone, otp_code)
 
     return {"message": "OTP sent successfully"}
 
 
 @router.post("/verify-otp")
 async def verify_otp(req: VerifyOTPRequest, db: AsyncSession = Depends(get_db)):
-    try:
-        approved = await check_verification(req.phone_number, req.code)
-    except VerificationNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    except VerifyError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-
-    if not approved:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Incorrect OTP code.")
-
-    # Mark the OTP record as verified
     otp_record = await db.scalar(
         select(OTP).where(
             OTP.phone_number == req.phone_number,
@@ -138,8 +124,14 @@ async def verify_otp(req: VerifyOTPRequest, db: AsyncSession = Depends(get_db)):
             OTP.verified == False,
         ).order_by(OTP.created_at.desc())
     )
-    if otp_record:
-        otp_record.verified = True
+
+    if not otp_record or otp_record.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OTP expired or not found.")
+
+    if otp_record.code != _hash_otp(req.code):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Incorrect OTP code.")
+
+    otp_record.verified = True
 
     user = User(
         phone_number=req.phone_number,
