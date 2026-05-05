@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import os
 import random
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config.database import get_db
 from models.user import OTP, User
 from models.wallet import Wallet
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -47,6 +50,31 @@ _DEFAULT_MONTHLY = 5_000_000
 class LoginRequest(BaseModel):
     phone_number: str
     pin: str
+
+
+def _send_otp_sms(phone_number: str, otp_code: str) -> None:
+    sid   = os.getenv("TWILIO_ACCOUNT_SID", "")
+    token = os.getenv("TWILIO_AUTH_TOKEN", "")
+    from_ = os.getenv("TWILIO_FROM_NUMBER", "")
+
+    if sid and token and from_:
+        from twilio.rest import Client
+        from twilio.base.exceptions import TwilioRestException
+        try:
+            Client(sid, token).messages.create(
+                body=f"Your Kalipeh verification code is {otp_code}. It expires in 5 minutes.",
+                from_=from_,
+                to=phone_number,
+            )
+        except TwilioRestException as exc:
+            logger.error("Twilio SMS failed for %s: %s", phone_number, exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Could not send OTP. Please try again.",
+            )
+    else:
+        # Twilio not configured — log for local development only
+        logger.warning("[DEV] OTP for %s: %s", phone_number, otp_code)
 
 
 def _generate_otp() -> str:
@@ -107,8 +135,7 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     db.add(otp)
     await db.commit()
 
-    # TODO: send OTP via SMS (Twilio) — print only for local dev
-    print(f"[DEV] OTP for {req.phone_number}: {otp_code}")
+    _send_otp_sms(req.phone_number, otp_code)
 
     return {"message": "OTP sent successfully"}
 
