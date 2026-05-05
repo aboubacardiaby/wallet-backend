@@ -1,14 +1,13 @@
 import hashlib
 import logging
 import os
-import random
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import get_db
@@ -29,11 +28,6 @@ class RegisterRequest(BaseModel):
 class VerifyOTPRequest(BaseModel):
     phone_number: str
     code: str
-    # Collected during registration wizard; used when the user record is created
-    user_type: str = "receiver"       # "sender" | "receiver"
-    home_currency: str = "XOF"
-    full_name: str = ""
-    home_country: str = ""
 
 
 # Wallet limits per currency
@@ -99,38 +93,22 @@ def _generate_token(user_id: str, phone_number: str) -> str:
 
 @router.post("/register")
 async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    existing = await db.scalar(select(User).where(User.phone_number == req.phone_number))
+    phone = req.phone_number if req.phone_number.startswith("+") else f"{req.country_code}{req.phone_number}"
+
+    existing = await db.scalar(select(User).where(User.phone_number == phone))
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists")
 
-    # Rate limit: max 3 OTP requests per phone per 10 minutes
-    window = datetime.utcnow() - timedelta(minutes=10)
-    recent_count = await db.scalar(
-        select(func.count()).select_from(OTP).where(
-            OTP.phone_number == req.phone_number,
-            OTP.created_at > window,
-        )
-    )
-    if recent_count >= 3:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many OTP requests. Please wait before trying again.",
-        )
+    try:
+        verification_sid = await send_verification(phone)
+    except VerifyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
-    # Invalidate any existing unverified OTPs for this phone
-    await db.execute(
-        delete(OTP).where(
-            OTP.phone_number == req.phone_number,
-            OTP.verified == False,
-        )
-    )
-
-    otp_code = _generate_otp()
     otp = OTP(
-        phone_number=req.phone_number,
-        code=_hash_otp(otp_code),
+        phone_number=phone,
+        code=verification_sid,
         purpose="registration",
-        expires_at=datetime.utcnow() + timedelta(minutes=5),
+        expires_at=datetime.utcnow() + timedelta(minutes=10),
     )
     db.add(otp)
     await db.commit()
@@ -142,41 +120,45 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
 @router.post("/verify-otp")
 async def verify_otp(req: VerifyOTPRequest, db: AsyncSession = Depends(get_db)):
-    otp = await db.scalar(
+    try:
+        approved = await check_verification(req.phone_number, req.code)
+    except VerificationNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except VerifyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    if not approved:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Incorrect OTP code.")
+
+    # Mark the OTP record as verified
+    otp_record = await db.scalar(
         select(OTP).where(
             OTP.phone_number == req.phone_number,
-            OTP.code == _hash_otp(req.code),
+            OTP.purpose == "registration",
             OTP.verified == False,
-            OTP.expires_at > datetime.utcnow(),
-        )
+        ).order_by(OTP.created_at.desc())
     )
-    if not otp:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OTP")
-
-    otp.verified = True
-
-    currency = req.home_currency.upper() if req.home_currency else "XOF"
+    if otp_record:
+        otp_record.verified = True
 
     user = User(
         phone_number=req.phone_number,
-        full_name=req.full_name or "",
-        country=req.home_country or "",
         is_verified=True,
         kyc_status="pending",
         preferred_lang="fr",
-        user_type=req.user_type or "receiver",
-        home_currency=currency,
+        user_type="receiver",
+        home_currency="XOF",
     )
     db.add(user)
-    await db.flush()  # get user.id before commit
+    await db.flush()
 
     wallet = Wallet(
         user_id=user.id,
         balance=0,
-        currency=currency,
+        currency=user.home_currency,
         status="active",
-        daily_limit=_DAILY_LIMITS.get(currency, _DEFAULT_DAILY),
-        monthly_limit=_MONTHLY_LIMITS.get(currency, _DEFAULT_MONTHLY),
+        daily_limit=_DAILY_LIMITS.get(user.home_currency, _DEFAULT_DAILY),
+        monthly_limit=_MONTHLY_LIMITS.get(user.home_currency, _DEFAULT_MONTHLY),
     )
     db.add(wallet)
     await db.commit()
