@@ -105,7 +105,7 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
         phone_number=phone,
         code=_hash_otp(otp_code),
         purpose="registration",
-        expires_at=datetime.utcnow() + timedelta(minutes=10),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
     )
     db.add(otp)
     await db.commit()
@@ -125,16 +125,16 @@ async def verify_otp(req: VerifyOTPRequest, db: AsyncSession = Depends(get_db)):
         ).order_by(OTP.created_at.desc())
     )
 
-    if not otp_record or otp_record.expires_at < datetime.utcnow():
+    if not otp_record or otp_record.expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OTP expired or not found.")
 
-    if otp_record.code != _hash_otp(req.code):
+    if otp_record.code != _hash_otp(req.code.strip()):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Incorrect OTP code.")
 
     otp_record.verified = True
 
     user = User(
-        phone_number=req.phone_number,
+        phone_number=otp_record.phone_number,
         is_verified=True,
         kyc_status="pending",
         preferred_lang="fr",
