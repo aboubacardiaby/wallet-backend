@@ -4,7 +4,11 @@
 # Virtual environment
 .venv/
 venv/
+venv311/
 env/
+
+# Claude Code
+.claude/
 
 # Python cache
 __pycache__/
