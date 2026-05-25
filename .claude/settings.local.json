@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py:*)",
+      "Bash(winget install:*)",
+      "Bash(venv311/Scripts/pip.exe install:*)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(C:UsersLenovoAppDataLocalProgramsPythonPython311python.exe -m pip install -r requirements.txt)",
+      "Bash(./venv311/Scripts/python.exe:*)",
+      "Bash(./venv311/Scripts/pip.exe install:*)",
+      "Bash(find:*)",
+      "Bash(taskkill:*)",
+      "Bash(\"/c/projects/repos/wallet-backend/venv311/Scripts/python.exe\" -m uvicorn main:app --host 0.0.0.0 --port 8080 --reload)",
+      "Bash(netstat:*)",
+      "Bash(findstr:*)",
+      "Bash(curl:*)",
+      "Bash(tasklist:*)",
+      "Bash(\"/c/projects/repos/wallet-backend/venv311/Scripts/python.exe\" -m uvicorn main:app --host 0.0.0.0 --port 8080)",
+      "Bash(venv311/Scripts/python.exe -m pip install:*)",
+      "Bash(venv311/Scripts/python.exe:*)"
+    ]
+  }
+}
