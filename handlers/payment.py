@@ -16,8 +16,15 @@ from config.database import get_db
 from middleware.auth import verify_token
 from models.ach_config import AchConfig
 from models.payment_method import PaymentMethod
+from models.user import User
 from models.wallet import Transaction, Wallet
 from services.ach import ACHConfigError, ACHError, AchClientConfig, initiate_credit, initiate_debit
+from services.card_payment import (
+    CardInfo,
+    CardPaymentError,
+    CustomerInfo,
+    process_card_payment,
+)
 from utils import row_to_dict
 
 router = APIRouter(tags=["payments"])
@@ -113,6 +120,17 @@ class TopUpRequest(BaseModel):
     amount: float
 
 
+class CardPaymentRequest(BaseModel):
+    """Request to process a card payment through Stripe."""
+    card_number: str
+    expiry_month: int
+    expiry_year: int
+    cvc: str
+    holder_name: Optional[str] = None
+    amount: float  # Amount in USD
+    description: Optional[str] = None
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/payment-methods")
@@ -162,6 +180,131 @@ async def add_card(
     await db.commit()
     await db.refresh(pm)
     return {"payment_method": row_to_dict(pm), "message": "Card added"}
+
+
+@router.post("/payment-methods/card/pay", status_code=201)
+async def process_card_payment_endpoint(
+    body: CardPaymentRequest,
+    token: dict = Depends(verify_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Process a card payment through Stripe via CardPaymentProcessorService.
+    This endpoint charges the card and credits the user's wallet.
+    """
+    if body.amount <= 0:
+        raise HTTPException(400, "Amount must be positive")
+
+    user_id = uuid.UUID(token["user_id"])
+
+    # Fetch user for customer information
+    user = await db.scalar(select(User).where(User.id == user_id))
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    # Get user's wallet
+    wallet = await db.scalar(select(Wallet).where(Wallet.user_id == user_id))
+    if not wallet:
+        raise HTTPException(404, "Wallet not found")
+    if wallet.status != "active":
+        raise HTTPException(403, "Wallet is not active")
+
+    # Prepare customer information for Stripe
+    customer_info = CustomerInfo(
+        email=user.email or f"{user.phone_number}@wallet.local",
+        name=user.full_name or None,
+        phone=user.phone_number,
+        metadata={
+            "user_id": str(user_id),
+            "wallet_id": str(wallet.id),
+        },
+    )
+
+    # Prepare card information
+    card_info = CardInfo(
+        number=body.card_number.replace(" ", ""),
+        exp_month=body.expiry_month,
+        exp_year=body.expiry_year,
+        cvc=body.cvc,
+        cardholder_name=body.holder_name,
+    )
+
+    # Convert amount to cents (Stripe uses cents)
+    amount_cents = int(body.amount * 100)
+
+    tx_ref = str(uuid.uuid4())
+    description = body.description or f"Wallet top-up for {user.phone_number}"
+
+    try:
+        # Call CardPaymentProcessorService
+        result = await process_card_payment(
+            customer=customer_info,
+            card=card_info,
+            amount_cents=amount_cents,
+            currency="usd",
+            description=description,
+        )
+    except CardPaymentError as exc:
+        # Create failed transaction record
+        tx = Transaction(
+            transaction_ref=tx_ref,
+            type="card_payment",
+            status="failed",
+            to_user_id=user_id,
+            to_phone=token["phone_number"],
+            amount=body.amount,
+            fee=0,
+            total_amount=body.amount,
+            currency="USD",
+            description=description,
+            extra_data={
+                "error": str(exc),
+                "error_step": exc.error_step,
+            },
+        )
+        db.add(tx)
+        await db.commit()
+        raise HTTPException(exc.status_code, str(exc))
+
+    # Credit the wallet
+    wallet.balance = float(wallet.balance) + body.amount
+    wallet.updated_at = datetime.utcnow()
+
+    # Create successful transaction record
+    tx = Transaction(
+        transaction_ref=tx_ref,
+        type="card_payment",
+        status="completed",
+        to_user_id=user_id,
+        to_phone=token["phone_number"],
+        amount=body.amount,
+        fee=0,
+        total_amount=body.amount,
+        currency="USD",
+        description=description,
+        completed_at=datetime.utcnow(),
+        extra_data={
+            "stripe_customer_id": result.customer_id,
+            "stripe_payment_intent_id": result.payment_intent_id,
+            "stripe_payment_method_id": result.payment_method_id,
+            "stripe_status": result.status,
+            "card_brand": result.card_brand,
+            "card_last4": result.card_last4,
+        },
+    )
+    db.add(tx)
+    await db.commit()
+
+    return {
+        "message": "Payment successful",
+        "transaction_ref": tx_ref,
+        "amount": body.amount,
+        "currency": "USD",
+        "new_balance": float(wallet.balance),
+        "stripe_payment_intent_id": result.payment_intent_id,
+        "card_brand": result.card_brand,
+        "card_last4": result.card_last4,
+    }
 
 
 @router.post("/payment-methods/bank", status_code=201)
