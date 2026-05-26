@@ -2,7 +2,7 @@ name: Build and Deploy to Cloud Run
 
 on:
   push:
-    branches: [main,develop-smstwilo]
+    branches: [main,f-develop]
   pull_request:
     branches: [main]
   workflow_dispatch:
