@@ -2,7 +2,7 @@ name: Build and Deploy to Cloud Run
 
 on:
   push:
-    branches: [main,f-develop]
+    branches: [main,f-develop,f-develop-july]
   pull_request:
     branches: [main]
   workflow_dispatch:

@@ -1,14 +1,14 @@
 """add routing_number and account_type to payment_methods
 
-Revision ID: 0007
-Revises: 0006
+Revision ID: 0007b
+Revises: 0007
 Create Date: 2026-05-03
 """
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0007"
-down_revision = "0006"
+revision = "0007b"
+down_revision = "0007"
 branch_labels = None
 depends_on = None
 

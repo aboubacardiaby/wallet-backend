@@ -65,6 +65,11 @@ def _get_timeout() -> int:
     return int(os.getenv("CARD_PAYMENT_SERVICE_TIMEOUT", "30"))
 
 
+def _get_verify_ssl() -> bool:
+    """Get SSL verification setting. Disable only for dev with self-signed certs."""
+    return os.getenv("CARD_PAYMENT_SERVICE_VERIFY_SSL", "true").lower() != "false"
+
+
 async def process_card_payment(
     customer: CustomerInfo,
     card: CardInfo,
@@ -111,6 +116,8 @@ async def process_card_payment(
     payload = {k: v for k, v in payload.items() if v is not None}
     if payload.get("card"):
         payload["card"] = {k: v for k, v in payload["card"].items() if v is not None}
+
+    verify_ssl = _get_verify_ssl()
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
@@ -187,7 +194,9 @@ async def get_payment_status(payment_intent_id: str) -> dict:
     base_url = _get_base_url()
     timeout = _get_timeout()
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    verify_ssl = _get_verify_ssl()
+
+    async with httpx.AsyncClient(timeout=timeout, verify=verify_ssl) as client:
         try:
             response = await client.get(
                 f"{base_url}/api/process/status/{payment_intent_id}",

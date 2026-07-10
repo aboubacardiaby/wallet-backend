@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+import urllib3
 
 from config.database import get_db
 from middleware.auth import verify_token
@@ -25,10 +26,19 @@ from services.card_payment import (
     CustomerInfo,
     process_card_payment,
 )
+from services.stripe_payment import (
+    ACHInfo as StripeACHInfo,
+    CreditCardInfo,
+    CustomerInfo as StripeCustomerInfo,
+    DebitCardInfo,
+    PaymentType,
+    StripePaymentError,
+    process_stripe_payment,
+)
 from utils import row_to_dict
 
 router = APIRouter(tags=["payments"])
-
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 VALID_TYPES = {"card", "bank_transfer", "paypal", "apple_pay", "google_pay"}
 
 BRAND_ICONS = {
@@ -122,13 +132,35 @@ class TopUpRequest(BaseModel):
 
 class CardPaymentRequest(BaseModel):
     """Request to process a card payment through Stripe."""
-    card_number: str
-    expiry_month: int
-    expiry_year: int
-    cvc: str
+    # Either provide full card details OR payment_method_id for saved cards
+    card_number: Optional[str] = None
+    expiry_month: Optional[int] = None
+    expiry_year: Optional[int] = None
+    cvc: Optional[str] = None
     holder_name: Optional[str] = None
+    payment_method_id: Optional[str] = None  # For saved cards
     amount: float  # Amount in USD
     description: Optional[str] = None
+
+
+class StripePaymentRequest(BaseModel):
+    """
+    Request to process a Stripe payment.
+    Supports debit card, credit card (stub), and ACH (stub).
+    """
+    payment_type: str  # "debit_card" | "credit_card" | "ach"
+    amount: float  # Amount in USD (dollars, not cents)
+    description: Optional[str] = None
+
+    # For debit/credit card payments (payment_method_id from Stripe.js)
+    payment_method_id: Optional[str] = None
+    cardholder_name: Optional[str] = None
+
+    # For ACH payments (stub)
+    routing_number: Optional[str] = None
+    account_number: Optional[str] = None
+    account_type: Optional[str] = "checking"  # "checking" | "savings"
+    account_holder_name: Optional[str] = None
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -191,6 +223,7 @@ async def process_card_payment_endpoint(
     """
     Process a card payment through Stripe via CardPaymentProcessorService.
     This endpoint charges the card and credits the user's wallet.
+    Supports both new card details and saved payment_method_id.
     """
     if body.amount <= 0:
         raise HTTPException(400, "Amount must be positive")
@@ -208,6 +241,60 @@ async def process_card_payment_endpoint(
         raise HTTPException(404, "Wallet not found")
     if wallet.status != "active":
         raise HTTPException(403, "Wallet is not active")
+
+    # Handle saved card payment (via payment_method_id)
+    if body.payment_method_id:
+        pm = await db.scalar(
+            select(PaymentMethod).where(
+                PaymentMethod.id == uuid.UUID(body.payment_method_id),
+                PaymentMethod.user_id == user_id,
+                PaymentMethod.type == "card",
+            )
+        )
+        if not pm:
+            raise HTTPException(404, "Payment method not found")
+
+        # Credit wallet
+        wallet.balance = float(wallet.balance) + body.amount
+        wallet.updated_at = datetime.utcnow()
+
+        tx_ref = str(uuid.uuid4())
+        description = body.description or f"Card payment via {pm.label}"
+
+        tx = Transaction(
+            transaction_ref=tx_ref,
+            type="card_payment",
+            status="completed",
+            to_user_id=user_id,
+            to_phone=token["phone_number"],
+            amount=body.amount,
+            fee=0,
+            total_amount=body.amount,
+            currency="USD",
+            description=description,
+            completed_at=datetime.utcnow(),
+            extra_data={
+                "payment_method_id": str(pm.id),
+                "card_brand": pm.card_brand,
+                "card_last4": pm.last4,
+            },
+        )
+        db.add(tx)
+        await db.commit()
+
+        return {
+            "message": "Payment successful",
+            "transaction_ref": tx_ref,
+            "amount": body.amount,
+            "currency": "USD",
+            "new_balance": float(wallet.balance),
+            "card_brand": pm.card_brand,
+            "card_last4": pm.last4,
+        }
+
+    # Validate required fields for new card payment
+    if not body.card_number or not body.expiry_month or not body.expiry_year or not body.cvc:
+        raise HTTPException(400, "Card details required: card_number, expiry_month, expiry_year, cvc")
 
     # Prepare customer information for Stripe
     customer_info = CustomerInfo(
@@ -237,6 +324,7 @@ async def process_card_payment_endpoint(
 
     try:
         # Call CardPaymentProcessorService
+        print(f"[CARD PAY] Calling process_card_payment with amount_cents={amount_cents}")
         result = await process_card_payment(
             customer=customer_info,
             card=card_info,
@@ -244,7 +332,9 @@ async def process_card_payment_endpoint(
             currency="usd",
             description=description,
         )
+        print(f"[CARD PAY] Result: payment_method_id={result.payment_method_id}, card_last4={result.card_last4}, card_brand={result.card_brand}")
     except CardPaymentError as exc:
+        print(f"[CARD PAY] Error: {exc}")
         # Create failed transaction record
         tx = Transaction(
             transaction_ref=tx_ref,
@@ -269,6 +359,40 @@ async def process_card_payment_endpoint(
     # Credit the wallet
     wallet.balance = float(wallet.balance) + body.amount
     wallet.updated_at = datetime.utcnow()
+
+    # Save or update PaymentMethod with Stripe PM ID for future use
+    if result.payment_method_id and result.card_last4:
+        # Check if a PaymentMethod exists with this card (by last4 and brand)
+        existing_pm = await db.scalar(
+            select(PaymentMethod).where(
+                PaymentMethod.user_id == user_id,
+                PaymentMethod.type == "card",
+                PaymentMethod.last4 == result.card_last4,
+                PaymentMethod.card_brand == (result.card_brand or "").lower(),
+            )
+        )
+        if existing_pm:
+            # Update with Stripe PM ID
+            print(f"[CARD PAY] Updating existing PM {existing_pm.id} with stripe_payment_method_id={result.payment_method_id}")
+            existing_pm.stripe_payment_method_id = result.payment_method_id
+        else:
+            # Create new PaymentMethod with Stripe PM ID
+            new_pm = PaymentMethod(
+                id=uuid.uuid4(),
+                user_id=user_id,
+                type="card",
+                card_brand=(result.card_brand or "unknown").lower(),
+                last4=result.card_last4,
+                expiry_month=result.card_exp_month,
+                expiry_year=result.card_exp_year,
+                holder_name=body.holder_name or "",
+                stripe_payment_method_id=result.payment_method_id,
+                label=_make_label("card", (result.card_brand or "unknown").lower(), result.card_last4, "", ""),
+                is_default=False,
+                created_at=datetime.utcnow(),
+            )
+            print(f"[CARD PAY] Creating new PM with stripe_payment_method_id={result.payment_method_id}")
+            db.add(new_pm)
 
     # Create successful transaction record
     tx = Transaction(
@@ -304,6 +428,212 @@ async def process_card_payment_endpoint(
         "stripe_payment_intent_id": result.payment_intent_id,
         "card_brand": result.card_brand,
         "card_last4": result.card_last4,
+    }
+
+
+@router.post("/stripe/pay", status_code=201)
+async def stripe_payment_endpoint(
+    body: StripePaymentRequest,
+    token: dict = Depends(verify_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Process a Stripe payment (debit card, credit card, or ACH).
+
+    - Debit card: Fully implemented via TalencePaymentsAPI
+    - Credit card: Stub (returns 501 Not Implemented)
+    - ACH: Stub (returns 501 Not Implemented)
+
+    For debit card payments, provide:
+    - payment_type: "debit_card"
+    - payment_method_id: Stripe PaymentMethod ID (pm_xxxx) from Stripe.js
+    - amount: Amount in USD (dollars)
+    """
+    if body.amount <= 0:
+        raise HTTPException(400, "Amount must be positive")
+
+    # Validate payment type
+    try:
+        payment_type = PaymentType(body.payment_type)
+    except ValueError:
+        raise HTTPException(
+            400,
+            f"Invalid payment_type. Must be one of: {', '.join(pt.value for pt in PaymentType)}",
+        )
+
+    user_id = uuid.UUID(token["user_id"])
+
+    # Fetch user for customer information
+    user = await db.scalar(select(User).where(User.id == user_id))
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    # Get user's wallet
+    wallet = await db.scalar(select(Wallet).where(Wallet.user_id == user_id))
+    if not wallet:
+        raise HTTPException(404, "Wallet not found")
+    if wallet.status != "active":
+        raise HTTPException(403, "Wallet is not active")
+
+    # Build customer info
+    customer = StripeCustomerInfo(
+        name=user.full_name or body.cardholder_name or "Unknown",
+        email=user.email or f"{user.phone_number}@wallet.local",
+        phone=user.phone_number,
+        metadata={
+            "user_id": str(user_id),
+            "wallet_id": str(wallet.id),
+        },
+    )
+
+    tx_ref = str(uuid.uuid4())
+    description = body.description or f"Stripe {payment_type.value} payment for {user.phone_number}"
+
+    # Build payment info based on type
+    debit_card = None
+    credit_card = None
+    ach = None
+
+    if payment_type == PaymentType.DEBIT_CARD:
+        if not body.payment_method_id:
+            raise HTTPException(400, "payment_method_id is required for debit card payments")
+
+        # Check if payment_method_id is a saved card from our database (UUID format)
+        # vs a real Stripe PaymentMethod ID (starts with 'pm_')
+        saved_pm = None
+        if not body.payment_method_id.startswith('pm_'):
+            try:
+                pm_uuid = uuid.UUID(body.payment_method_id)
+                saved_pm = await db.scalar(
+                    select(PaymentMethod).where(
+                        PaymentMethod.id == pm_uuid,
+                        PaymentMethod.user_id == user_id,
+                        PaymentMethod.type == "card",
+                    )
+                )
+            except ValueError:
+                pass  # Not a valid UUID, treat as Stripe PM ID
+
+        # If it's a saved card from our DB, check if it has a Stripe PM ID
+        if saved_pm:
+            if saved_pm.stripe_payment_method_id:
+                # Use the stored Stripe PaymentMethod ID
+                debit_card = DebitCardInfo(
+                    payment_method_id=saved_pm.stripe_payment_method_id,
+                    cardholder_name=saved_pm.holder_name or body.cardholder_name,
+                )
+            else:
+                # No Stripe PM ID stored - card needs to be re-added with payment
+                raise HTTPException(
+                    400,
+                    "This card needs to be re-verified. Please add a new card or use a different payment method."
+                )
+        else:
+            # Use the provided Stripe PaymentMethod ID directly
+            debit_card = DebitCardInfo(
+                payment_method_id=body.payment_method_id,
+                cardholder_name=body.cardholder_name,
+            )
+
+    elif payment_type == PaymentType.CREDIT_CARD:
+        if not body.payment_method_id:
+            raise HTTPException(400, "payment_method_id is required for credit card payments")
+        credit_card = CreditCardInfo(
+            payment_method_id=body.payment_method_id,
+            cardholder_name=body.cardholder_name,
+        )
+
+    elif payment_type == PaymentType.ACH:
+        if not body.routing_number or not body.account_number:
+            raise HTTPException(400, "routing_number and account_number are required for ACH payments")
+        ach = StripeACHInfo(
+            routing_number=body.routing_number,
+            account_number=body.account_number,
+            account_type=body.account_type or "checking",
+            account_holder_name=body.account_holder_name or customer.name,
+        )
+
+    try:
+        result = await process_stripe_payment(
+            payment_type=payment_type,
+            customer=customer,
+            amount=body.amount,
+            currency="usd",
+            description=description,
+            debit_card=debit_card,
+            credit_card=credit_card,
+            ach=ach,
+        )
+    except StripePaymentError as exc:
+        # Handle 3DS required
+        if exc.requires_action:
+            return {
+                "message": "Payment requires additional authentication",
+                "requires_action": True,
+                "client_secret": exc.client_secret,
+                "status_code": 202,
+            }
+
+        # Create failed transaction record
+        tx = Transaction(
+            transaction_ref=tx_ref,
+            type=f"stripe_{payment_type.value}",
+            status="failed",
+            to_user_id=user_id,
+            to_phone=token["phone_number"],
+            amount=body.amount,
+            fee=0,
+            total_amount=body.amount,
+            currency="USD",
+            description=description,
+            extra_data={
+                "error": str(exc),
+                "error_code": exc.error_code,
+                "payment_type": payment_type.value,
+            },
+        )
+        db.add(tx)
+        await db.commit()
+        raise HTTPException(exc.status_code, str(exc))
+
+    # Credit the wallet
+    wallet.balance = float(wallet.balance) + body.amount
+    wallet.updated_at = datetime.utcnow()
+
+    # Create successful transaction record
+    tx = Transaction(
+        transaction_ref=tx_ref,
+        type=f"stripe_{payment_type.value}",
+        status="completed",
+        to_user_id=user_id,
+        to_phone=token["phone_number"],
+        amount=body.amount,
+        fee=0,
+        total_amount=body.amount,
+        currency="USD",
+        description=description,
+        completed_at=datetime.utcnow(),
+        extra_data={
+            "stripe_transaction_id": result.transaction_id,
+            "stripe_charge_id": result.charge_id,
+            "stripe_status": result.status,
+            "payment_type": payment_type.value,
+            "receipt_url": result.receipt_url,
+        },
+    )
+    db.add(tx)
+    await db.commit()
+
+    return {
+        "message": "Payment successful",
+        "transaction_ref": tx_ref,
+        "amount": body.amount,
+        "currency": "USD",
+        "new_balance": float(wallet.balance),
+        "payment_type": payment_type.value,
+        "stripe_transaction_id": result.transaction_id,
+        "stripe_charge_id": result.charge_id,
+        "receipt_url": result.receipt_url,
     }
 
 

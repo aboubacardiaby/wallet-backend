@@ -27,6 +27,7 @@ class PaymentMethod(Base):
     # Card fields
     card_brand: Mapped[str] = mapped_column(String(20), nullable=False, server_default="")   # visa | mastercard | amex | discover
     last4: Mapped[str] = mapped_column(String(4), nullable=False, server_default="")
+    stripe_payment_method_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Stripe PM ID (pm_xxx)
     expiry_month: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     expiry_year: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     holder_name: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
