@@ -8,13 +8,15 @@ from fastapi.responses import JSONResponse
 
 load_dotenv()
 
-from config.database import connect_db, disconnect_db
+from config.database import connect_db, database_ready, disconnect_db
+from config.runtime import cors_origins, jwt_secret
 from handlers import admin, auth, cash, exchange, kyc, notification, payment, qr, recipient, transfer, user, wallet
 from middleware.ratelimit import rate_limiter
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    jwt_secret()
     await connect_db()
     # Pre-load rate overrides and fee rules into memory
     from config.database import _SessionLocal
@@ -31,10 +33,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Kalipeh Wallet API", version="1.0.0", lifespan=lifespan)
 
+allowed_origins = cors_origins()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=bool(allowed_origins),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -52,6 +56,13 @@ async def apply_rate_limit(request: Request, call_next):
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+@app.get("/ready")
+async def ready():
+    if not await database_ready():
+        return JSONResponse(status_code=503, content={"status": "not_ready", "database": "unavailable"})
+    return {"status": "ready", "database": "available"}
 
 
 prefix = "/api/v1"

@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from config.database import get_db
+from config.runtime import jwt_secret
 from config.smtp import resolve_smtp, send_email, smtp_env, _send_sync
 from config.rate_config import (
     calculate_fee, clear_rate_override, get_rate_override,
@@ -117,7 +118,6 @@ class SettingsUpdateRequest(BaseModel):
 @router.post("/login")
 async def admin_login(body: AdminLoginRequest, db: AsyncSession = Depends(get_db)):
     """Issue an admin JWT. Checks DB admin_users first, falls back to env vars."""
-    jwt_secret = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
     role = "super_admin"
 
     # Try DB-based admin user first
@@ -130,8 +130,10 @@ async def admin_login(body: AdminLoginRequest, db: AsyncSession = Depends(get_db
         role = db_user.role
     else:
         # Env-var fallback (always super_admin)
-        expected_user = os.getenv("ADMIN_USERNAME", "admin")
-        expected_pass = os.getenv("ADMIN_PASSWORD", "admin123")
+        expected_user = os.getenv("ADMIN_USERNAME")
+        expected_pass = os.getenv("ADMIN_PASSWORD")
+        if not expected_user or not expected_pass:
+            raise HTTPException(status_code=503, detail="Administrative login is not configured")
         if body.username != expected_user or body.password != expected_pass:
             raise HTTPException(status_code=401, detail="Invalid admin credentials")
 
@@ -143,7 +145,7 @@ async def admin_login(body: AdminLoginRequest, db: AsyncSession = Depends(get_db
             "iat":      datetime.utcnow(),
             "exp":      datetime.utcnow() + timedelta(hours=12),
         },
-        jwt_secret,
+        jwt_secret(),
         algorithm="HS256",
     )
     return {
@@ -366,7 +368,7 @@ async def create_wallet(
 async def update_wallet(
     wallet_id: str,
     body: UpdateWalletRequest,
-    token: dict = Depends(verify_admin_token),
+    token: dict = Depends(require_role("super_admin")),
     db: AsyncSession = Depends(get_db),
 ):
     wallet = await db.scalar(select(Wallet).where(Wallet.id == uuid_lib.UUID(wallet_id)))

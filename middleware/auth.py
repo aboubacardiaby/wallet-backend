@@ -1,16 +1,15 @@
-import os
 from fastapi import Depends, HTTPException, Security, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
+from config.runtime import jwt_secret
 
 security = HTTPBearer()
 
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)) -> dict:
     token = credentials.credentials
-    jwt_secret = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
     try:
-        return jwt.decode(token, jwt_secret, algorithms=["HS256"])
+        return jwt.decode(token, jwt_secret(), algorithms=["HS256"])
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired")
     except jwt.InvalidTokenError:
@@ -27,8 +26,12 @@ def verify_admin_token(credentials: HTTPAuthorizationCredentials = Security(secu
 def require_role(*allowed_roles: str):
     """Dependency factory — restricts an endpoint to specific roles."""
     def _check(payload: dict = Depends(verify_admin_token)) -> dict:
-        # Tokens issued before roles existed default to super_admin for safety
-        role = payload.get("role", "super_admin")
+        role = payload.get("role")
+        if not role:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin token is missing a role; sign in again",
+            )
         if role not in allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

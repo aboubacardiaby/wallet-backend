@@ -8,8 +8,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import get_db
+from config.runtime import allow_simulated_funding
 from middleware.auth import verify_token
 from models.wallet import Agent, Transaction, Wallet
+from services.wallet_policy import credit, debit
 from utils import row_to_dict
 
 router = APIRouter(tags=["cash"])
@@ -41,6 +43,11 @@ async def cash_in(
 ):
     if req.amount <= 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Amount must be positive")
+    if not allow_simulated_funding():
+        raise HTTPException(
+            status_code=503,
+            detail="Direct cash-in is disabled until an agent-confirmation workflow is configured",
+        )
 
     user_id = uuid_lib.UUID(token["user_id"])
     agent = await db.scalar(
@@ -57,8 +64,7 @@ async def cash_in(
     if not wallet or wallet.status != "active":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Wallet unavailable")
 
-    wallet.balance = float(wallet.balance) + req.amount
-    wallet.updated_at = datetime.utcnow()
+    credit(wallet, req.amount)
 
     tx_ref = str(uuid_lib.uuid4())
     now = datetime.utcnow()
@@ -102,13 +108,7 @@ async def cash_out(
     )
     if not wallet or wallet.status != "active":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Wallet unavailable")
-    if float(wallet.balance) < req.amount:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Insufficient balance")
-
-    wallet.balance = float(wallet.balance) - req.amount
-    wallet.daily_spent = float(wallet.daily_spent) + req.amount
-    wallet.monthly_spent = float(wallet.monthly_spent) + req.amount
-    wallet.updated_at = datetime.utcnow()
+    debit(wallet, req.amount)
 
     tx_ref = str(uuid_lib.uuid4())
     now = datetime.utcnow()

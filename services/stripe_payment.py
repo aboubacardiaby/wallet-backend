@@ -111,8 +111,8 @@ def _get_timeout() -> int:
 
 
 def _get_verify_ssl() -> bool:
-    """Get SSL verification setting. Defaults to false for local dev with self-signed certs."""
-    return os.getenv("TALENCE_PAYMENTS_API_VERIFY_SSL", "false").lower() != "false"
+    """Get SSL verification setting. Disable only for local dev with self-signed certs."""
+    return os.getenv("TALENCE_PAYMENTS_API_VERIFY_SSL", "true").lower() != "false"
 
 
 # ── Debit Card Processing (via TalencePaymentsAPI) ────────────────────────────

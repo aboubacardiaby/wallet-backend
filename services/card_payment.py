@@ -119,7 +119,7 @@ async def process_card_payment(
 
     verify_ssl = _get_verify_ssl()
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, verify=verify_ssl) as client:
         try:
             response = await client.post(
                 f"{base_url}/api/process/payment",

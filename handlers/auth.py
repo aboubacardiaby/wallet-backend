@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config.database import get_db
 from models.user import OTP, User
 from models.wallet import Wallet
+from config.runtime import jwt_secret
 
 logger = logging.getLogger(__name__)
 
@@ -82,14 +83,13 @@ def _hash_otp(code: str) -> str:
 
 
 def _generate_token(user_id: str, phone_number: str) -> str:
-    jwt_secret = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
     payload = {
         "user_id": user_id,
         "phone_number": phone_number,
         "exp": datetime.now(timezone.utc) + timedelta(hours=24),
         "iat": datetime.now(timezone.utc),
     }
-    return jwt.encode(payload, jwt_secret, algorithm="HS256")
+    return jwt.encode(payload, jwt_secret(), algorithm="HS256")
 
 
 @router.post("/register")

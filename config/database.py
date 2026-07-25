@@ -33,8 +33,6 @@ async def connect_db():
 
     if _is_supabase(url):
         ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
         connect_args["ssl"] = ssl_ctx
 
     _engine = create_async_engine(
@@ -73,5 +71,18 @@ async def disconnect_db():
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    if _SessionLocal is None:
+        raise RuntimeError("Database session factory is unavailable")
     async with _SessionLocal() as session:
         yield session
+
+
+async def database_ready() -> bool:
+    if _engine is None:
+        return False
+    try:
+        async with _engine.connect() as conn:
+            await conn.execute(__import__("sqlalchemy").text("SELECT 1"))
+        return True
+    except Exception:
+        return False

@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import get_db
-from middleware.auth import verify_token
+from middleware.auth import require_role, verify_token
 from models.kyc import KYCSubmission
 from models.user import User
 from utils import row_to_dict
@@ -130,7 +130,7 @@ async def submit_kyc(
 @router.get("/admin/kyc/submissions")
 async def list_kyc_submissions(
     kyc_status: Optional[str] = None,
-    token: dict = Depends(verify_token),
+    token: dict = Depends(require_role("super_admin", "compliance")),
     db: AsyncSession = Depends(get_db),
 ):
     """List all KYC submissions (admin). Filter by status if provided."""
@@ -145,7 +145,7 @@ async def list_kyc_submissions(
 async def review_kyc(
     submission_id: str,
     body: KYCReviewRequest,
-    token: dict = Depends(verify_token),
+    token: dict = Depends(require_role("super_admin", "compliance")),
     db: AsyncSession = Depends(get_db),
 ):
     """Approve or reject a KYC submission (admin)."""

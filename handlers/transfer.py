@@ -20,6 +20,7 @@ from config.database import get_db
 from middleware.auth import verify_token
 from models.user import User
 from models.wallet import MoneyRequest, Transaction, Wallet
+from services.wallet_policy import credit, debit
 from utils import row_to_dict
 
 # ── Static agent locations ────────────────────────────────────────────────────
@@ -281,8 +282,6 @@ async def send_money(
         raise HTTPException(status_code=404, detail="Sender wallet not found")
     if sender_wallet.status != "active":
         raise HTTPException(status_code=403, detail="Wallet is not active")
-    if float(sender_wallet.balance) < req.amount:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
 
     recipient_wallet = await db.scalar(
         select(Wallet).where(Wallet.user_id == recipient.id).with_for_update()
@@ -306,14 +305,10 @@ async def send_money(
         received = round(net_send * rate, 2)
 
     # Debit sender (full amount including fee)
-    sender_wallet.balance    = float(sender_wallet.balance) - req.amount
-    sender_wallet.daily_spent   = float(sender_wallet.daily_spent) + req.amount
-    sender_wallet.monthly_spent = float(sender_wallet.monthly_spent) + req.amount
-    sender_wallet.updated_at = datetime.utcnow()
+    debit(sender_wallet, req.amount)
 
     # Credit receiver (after conversion)
-    recipient_wallet.balance   = float(recipient_wallet.balance) + received
-    recipient_wallet.updated_at = datetime.utcnow()
+    credit(recipient_wallet, received)
 
     now = datetime.utcnow()
     tx = Transaction(
@@ -501,8 +496,6 @@ async def cash_pickup(
         raise HTTPException(status_code=404, detail="Sender wallet not found")
     if sender_wallet.status != "active":
         raise HTTPException(status_code=403, detail="Wallet is not active")
-    if float(sender_wallet.balance) < req.amount:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
 
     send_ccy = sender_wallet.currency
     recv_ccy = req.recv_currency.upper()
@@ -531,10 +524,7 @@ async def cash_pickup(
     pickup_code = f"{random.randint(0, 999999):06d}"
 
     # Debit sender wallet
-    sender_wallet.balance       = float(sender_wallet.balance) - req.amount
-    sender_wallet.daily_spent   = float(sender_wallet.daily_spent) + req.amount
-    sender_wallet.monthly_spent = float(sender_wallet.monthly_spent) + req.amount
-    sender_wallet.updated_at    = datetime.utcnow()
+    debit(sender_wallet, req.amount)
 
     tx = Transaction(
         transaction_ref=str(uuid_lib.uuid4()),
@@ -606,8 +596,6 @@ async def wave_transfer(
         raise HTTPException(status_code=404, detail="Sender wallet not found")
     if sender_wallet.status != "active":
         raise HTTPException(status_code=403, detail="Wallet is not active")
-    if float(sender_wallet.balance) < req.amount:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
 
     send_ccy = sender_wallet.currency
     recv_ccy = req.recv_currency.upper()
@@ -635,10 +623,7 @@ async def wave_transfer(
     )
 
     # Debit sender wallet
-    sender_wallet.balance       = float(sender_wallet.balance) - req.amount
-    sender_wallet.daily_spent   = float(sender_wallet.daily_spent) + req.amount
-    sender_wallet.monthly_spent = float(sender_wallet.monthly_spent) + req.amount
-    sender_wallet.updated_at    = datetime.utcnow()
+    debit(sender_wallet, req.amount)
 
     tx = Transaction(
         transaction_ref=str(uuid_lib.uuid4()),

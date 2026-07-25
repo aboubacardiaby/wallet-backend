@@ -15,6 +15,27 @@ from utils import row_to_dict
 
 router = APIRouter(tags=["user"])
 
+# Explicit allowlist of self-service-editable profile fields. Anything not
+# listed here — including security-sensitive columns like pin_attempts,
+# is_locked, kyc_status, and user_type — is rejected by design.
+ALLOWED_PROFILE_FIELDS = {
+    "full_name",
+    "email",
+    "profile_photo",
+    "national_id_type",
+    "national_id_number",
+    "date_of_birth",
+    "street",
+    "city",
+    "region",
+    "country",
+    "postal_code",
+    "home_currency",
+    "preferred_lang",
+    "biometric_enabled",
+    "device_tokens",
+}
+
 
 class SetPINRequest(BaseModel):
     pin: str
@@ -46,11 +67,8 @@ async def update_profile(
 ):
     user = await _get_user_or_404(token["user_id"], db)
 
-    protected = ("phone_number", "pin", "is_verified")
-    allowed_cols = {c.name for c in User.__table__.columns} - set(protected)
-
     for key, val in update_data.items():
-        if key in allowed_cols:
+        if key in ALLOWED_PROFILE_FIELDS:
             setattr(user, key, val)
 
     user.updated_at = datetime.utcnow()

@@ -11,21 +11,16 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-import urllib3
 
 from config.database import get_db
+from config.runtime import allow_simulated_funding
 from middleware.auth import verify_token
 from models.ach_config import AchConfig
 from models.payment_method import PaymentMethod
 from models.user import User
 from models.wallet import Transaction, Wallet
 from services.ach import ACHConfigError, ACHError, AchClientConfig, initiate_credit, initiate_debit
-from services.card_payment import (
-    CardInfo,
-    CardPaymentError,
-    CustomerInfo,
-    process_card_payment,
-)
+from services.wallet_policy import credit, debit
 from services.stripe_payment import (
     ACHInfo as StripeACHInfo,
     CreditCardInfo,
@@ -38,7 +33,6 @@ from services.stripe_payment import (
 from utils import row_to_dict
 
 router = APIRouter(tags=["payments"])
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 VALID_TYPES = {"card", "bank_transfer", "paypal", "apple_pay", "google_pay"}
 
 BRAND_ICONS = {
@@ -50,26 +44,6 @@ BRAND_ICONS = {
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _detect_brand(number: str) -> str:
-    n = number.replace(" ", "")
-    if n.startswith("4"):
-        return "visa"
-    if n[:2] in ("34", "37"):
-        return "amex"
-    if n[:4] in ("6011", "6512", "6304"):
-        return "discover"
-    try:
-        pfx = int(n[:2])
-        if 51 <= pfx <= 55:
-            return "mastercard"
-        pfx4 = int(n[:4])
-        if 2221 <= pfx4 <= 2720:
-            return "mastercard"
-    except ValueError:
-        pass
-    return "unknown"
-
 
 def _make_label(pm_type: str, brand: str, last4: str, bank_name: str, email: str, account_type: str = "") -> str:
     if pm_type == "card":
@@ -97,10 +71,13 @@ async def _clear_default(user_id: uuid.UUID, db: AsyncSession):
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
 
 class AddCardRequest(BaseModel):
-    card_number: str          # full number — last4 extracted, rest discarded
-    expiry_month: int
-    expiry_year: int
-    holder_name: str
+    """Card is tokenized client-side (Stripe SDK) — the raw PAN/CVC never reach this API."""
+    payment_method_id: str    # Stripe PaymentMethod ID (pm_xxx)
+    card_brand: Optional[str] = None
+    last4: Optional[str] = None
+    expiry_month: Optional[int] = None
+    expiry_year: Optional[int] = None
+    holder_name: Optional[str] = None
     set_default: bool = False
 
 
@@ -131,14 +108,9 @@ class TopUpRequest(BaseModel):
 
 
 class CardPaymentRequest(BaseModel):
-    """Request to process a card payment through Stripe."""
-    # Either provide full card details OR payment_method_id for saved cards
-    card_number: Optional[str] = None
-    expiry_month: Optional[int] = None
-    expiry_year: Optional[int] = None
-    cvc: Optional[str] = None
-    holder_name: Optional[str] = None
-    payment_method_id: Optional[str] = None  # For saved cards
+    """Pay with an already-saved card. Raw card details are never accepted here —
+    new cards must be tokenized client-side and charged via /stripe/pay."""
+    payment_method_id: str
     amount: float  # Amount in USD
     description: Optional[str] = None
 
@@ -185,12 +157,11 @@ async def add_card(
     db: AsyncSession = Depends(get_db),
 ):
     user_id = uuid.UUID(token["user_id"])
-    digits = body.card_number.replace(" ", "")
-    if len(digits) < 13:
-        raise HTTPException(400, "Invalid card number")
+    if not body.payment_method_id:
+        raise HTTPException(400, "payment_method_id is required")
 
-    last4 = digits[-4:]
-    brand = _detect_brand(digits)
+    brand = body.card_brand or "unknown"
+    last4 = body.last4 or ""
 
     if body.set_default:
         await _clear_default(user_id, db)
@@ -201,9 +172,10 @@ async def add_card(
         type="card",
         card_brand=brand,
         last4=last4,
+        stripe_payment_method_id=body.payment_method_id,
         expiry_month=body.expiry_month,
         expiry_year=body.expiry_year,
-        holder_name=body.holder_name,
+        holder_name=body.holder_name or "",
         label=_make_label("card", brand, last4, "", ""),
         is_default=body.set_default,
         created_at=datetime.utcnow(),
@@ -221,13 +193,17 @@ async def process_card_payment_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Process a card payment through Stripe via CardPaymentProcessorService.
-    This endpoint charges the card and credits the user's wallet.
-    Supports both new card details and saved payment_method_id.
+    Pay with an already-saved card (payment_method_id). This endpoint credits
+    the user's wallet. Raw card details are never accepted — tokenize new
+    cards client-side and charge them via /stripe/pay.
     """
+    raise HTTPException(
+        status_code=410,
+        detail="This unsafe legacy endpoint is disabled. Use /stripe/pay with the saved payment method.",
+    )
+
     if body.amount <= 0:
         raise HTTPException(400, "Amount must be positive")
-
     user_id = uuid.UUID(token["user_id"])
 
     # Fetch user for customer information
@@ -242,159 +218,23 @@ async def process_card_payment_endpoint(
     if wallet.status != "active":
         raise HTTPException(403, "Wallet is not active")
 
-    # Handle saved card payment (via payment_method_id)
-    if body.payment_method_id:
-        pm = await db.scalar(
-            select(PaymentMethod).where(
-                PaymentMethod.id == uuid.UUID(body.payment_method_id),
-                PaymentMethod.user_id == user_id,
-                PaymentMethod.type == "card",
-            )
+    pm = await db.scalar(
+        select(PaymentMethod).where(
+            PaymentMethod.id == uuid.UUID(body.payment_method_id),
+            PaymentMethod.user_id == user_id,
+            PaymentMethod.type == "card",
         )
-        if not pm:
-            raise HTTPException(404, "Payment method not found")
-
-        # Credit wallet
-        wallet.balance = float(wallet.balance) + body.amount
-        wallet.updated_at = datetime.utcnow()
-
-        tx_ref = str(uuid.uuid4())
-        description = body.description or f"Card payment via {pm.label}"
-
-        tx = Transaction(
-            transaction_ref=tx_ref,
-            type="card_payment",
-            status="completed",
-            to_user_id=user_id,
-            to_phone=token["phone_number"],
-            amount=body.amount,
-            fee=0,
-            total_amount=body.amount,
-            currency="USD",
-            description=description,
-            completed_at=datetime.utcnow(),
-            extra_data={
-                "payment_method_id": str(pm.id),
-                "card_brand": pm.card_brand,
-                "card_last4": pm.last4,
-            },
-        )
-        db.add(tx)
-        await db.commit()
-
-        return {
-            "message": "Payment successful",
-            "transaction_ref": tx_ref,
-            "amount": body.amount,
-            "currency": "USD",
-            "new_balance": float(wallet.balance),
-            "card_brand": pm.card_brand,
-            "card_last4": pm.last4,
-        }
-
-    # Validate required fields for new card payment
-    if not body.card_number or not body.expiry_month or not body.expiry_year or not body.cvc:
-        raise HTTPException(400, "Card details required: card_number, expiry_month, expiry_year, cvc")
-
-    # Prepare customer information for Stripe
-    customer_info = CustomerInfo(
-        email=user.email or f"{user.phone_number}@wallet.local",
-        name=user.full_name or None,
-        phone=user.phone_number,
-        metadata={
-            "user_id": str(user_id),
-            "wallet_id": str(wallet.id),
-        },
     )
+    if not pm:
+        raise HTTPException(404, "Payment method not found")
 
-    # Prepare card information
-    card_info = CardInfo(
-        number=body.card_number.replace(" ", ""),
-        exp_month=body.expiry_month,
-        exp_year=body.expiry_year,
-        cvc=body.cvc,
-        cardholder_name=body.holder_name,
-    )
-
-    # Convert amount to cents (Stripe uses cents)
-    amount_cents = int(body.amount * 100)
-
-    tx_ref = str(uuid.uuid4())
-    description = body.description or f"Wallet top-up for {user.phone_number}"
-
-    try:
-        # Call CardPaymentProcessorService
-        print(f"[CARD PAY] Calling process_card_payment with amount_cents={amount_cents}")
-        result = await process_card_payment(
-            customer=customer_info,
-            card=card_info,
-            amount_cents=amount_cents,
-            currency="usd",
-            description=description,
-        )
-        print(f"[CARD PAY] Result: payment_method_id={result.payment_method_id}, card_last4={result.card_last4}, card_brand={result.card_brand}")
-    except CardPaymentError as exc:
-        print(f"[CARD PAY] Error: {exc}")
-        # Create failed transaction record
-        tx = Transaction(
-            transaction_ref=tx_ref,
-            type="card_payment",
-            status="failed",
-            to_user_id=user_id,
-            to_phone=token["phone_number"],
-            amount=body.amount,
-            fee=0,
-            total_amount=body.amount,
-            currency="USD",
-            description=description,
-            extra_data={
-                "error": str(exc),
-                "error_step": exc.error_step,
-            },
-        )
-        db.add(tx)
-        await db.commit()
-        raise HTTPException(exc.status_code, str(exc))
-
-    # Credit the wallet
+    # Credit wallet
     wallet.balance = float(wallet.balance) + body.amount
     wallet.updated_at = datetime.utcnow()
 
-    # Save or update PaymentMethod with Stripe PM ID for future use
-    if result.payment_method_id and result.card_last4:
-        # Check if a PaymentMethod exists with this card (by last4 and brand)
-        existing_pm = await db.scalar(
-            select(PaymentMethod).where(
-                PaymentMethod.user_id == user_id,
-                PaymentMethod.type == "card",
-                PaymentMethod.last4 == result.card_last4,
-                PaymentMethod.card_brand == (result.card_brand or "").lower(),
-            )
-        )
-        if existing_pm:
-            # Update with Stripe PM ID
-            print(f"[CARD PAY] Updating existing PM {existing_pm.id} with stripe_payment_method_id={result.payment_method_id}")
-            existing_pm.stripe_payment_method_id = result.payment_method_id
-        else:
-            # Create new PaymentMethod with Stripe PM ID
-            new_pm = PaymentMethod(
-                id=uuid.uuid4(),
-                user_id=user_id,
-                type="card",
-                card_brand=(result.card_brand or "unknown").lower(),
-                last4=result.card_last4,
-                expiry_month=result.card_exp_month,
-                expiry_year=result.card_exp_year,
-                holder_name=body.holder_name or "",
-                stripe_payment_method_id=result.payment_method_id,
-                label=_make_label("card", (result.card_brand or "unknown").lower(), result.card_last4, "", ""),
-                is_default=False,
-                created_at=datetime.utcnow(),
-            )
-            print(f"[CARD PAY] Creating new PM with stripe_payment_method_id={result.payment_method_id}")
-            db.add(new_pm)
+    tx_ref = str(uuid.uuid4())
+    description = body.description or f"Card payment via {pm.label}"
 
-    # Create successful transaction record
     tx = Transaction(
         transaction_ref=tx_ref,
         type="card_payment",
@@ -408,12 +248,9 @@ async def process_card_payment_endpoint(
         description=description,
         completed_at=datetime.utcnow(),
         extra_data={
-            "stripe_customer_id": result.customer_id,
-            "stripe_payment_intent_id": result.payment_intent_id,
-            "stripe_payment_method_id": result.payment_method_id,
-            "stripe_status": result.status,
-            "card_brand": result.card_brand,
-            "card_last4": result.card_last4,
+            "payment_method_id": str(pm.id),
+            "card_brand": pm.card_brand,
+            "card_last4": pm.last4,
         },
     )
     db.add(tx)
@@ -425,9 +262,8 @@ async def process_card_payment_endpoint(
         "amount": body.amount,
         "currency": "USD",
         "new_balance": float(wallet.balance),
-        "stripe_payment_intent_id": result.payment_intent_id,
-        "card_brand": result.card_brand,
-        "card_last4": result.card_last4,
+        "card_brand": pm.card_brand,
+        "card_last4": pm.last4,
     }
 
 
@@ -596,9 +432,11 @@ async def stripe_payment_endpoint(
         await db.commit()
         raise HTTPException(exc.status_code, str(exc))
 
-    # Credit the wallet
-    wallet.balance = float(wallet.balance) + body.amount
-    wallet.updated_at = datetime.utcnow()
+    # Re-lock after the provider call so concurrent credits cannot overwrite one another.
+    wallet = await db.scalar(
+        select(Wallet).where(Wallet.user_id == user_id).with_for_update()
+    )
+    credit(wallet, body.amount)
 
     # Create successful transaction record
     tx = Transaction(
@@ -662,11 +500,6 @@ async def add_bank(
         label=_make_label("bank_transfer", "", last4, body.bank_name, "", body.account_type),
         is_default=body.set_default,
         created_at=datetime.utcnow(),
-        metadata_={
-            "routing_number": body.routing_number,
-            "account_number": body.account_number,
-            "account_type": body.account_type,
-        },
     )
     db.add(pm)
     await db.commit()
@@ -777,6 +610,8 @@ async def top_up(
     """
     if body.amount <= 0:
         raise HTTPException(400, "Amount must be positive")
+    if not allow_simulated_funding():
+        raise HTTPException(503, "Simulated top-up is disabled. Use a configured payment provider.")
 
     user_id = uuid.UUID(token["user_id"])
     pm = await db.scalar(
@@ -788,14 +623,15 @@ async def top_up(
     if not pm:
         raise HTTPException(404, "Payment method not found")
 
-    wallet = await db.scalar(select(Wallet).where(Wallet.user_id == user_id))
+    wallet = await db.scalar(
+        select(Wallet).where(Wallet.user_id == user_id).with_for_update()
+    )
     if not wallet:
         raise HTTPException(404, "Wallet not found")
     if wallet.status != "active":
         raise HTTPException(403, "Wallet is not active")
 
-    wallet.balance = float(wallet.balance) + body.amount
-    wallet.updated_at = datetime.utcnow()
+    credit(wallet, body.amount)
 
     tx = Transaction(
         transaction_ref=str(uuid.uuid4()),
@@ -876,7 +712,9 @@ async def ach_debit(
         raise HTTPException(400, "Amount must be positive")
 
     user_id = uuid.UUID(token["user_id"])
-    wallet = await db.scalar(select(Wallet).where(Wallet.user_id == user_id))
+    wallet = await db.scalar(
+        select(Wallet).where(Wallet.user_id == user_id).with_for_update()
+    )
     if not wallet:
         raise HTTPException(404, "Wallet not found")
     if wallet.status != "active":
@@ -945,13 +783,14 @@ async def ach_credit(
         raise HTTPException(400, "Amount must be positive")
 
     user_id = uuid.UUID(token["user_id"])
-    wallet = await db.scalar(select(Wallet).where(Wallet.user_id == user_id))
+    wallet = await db.scalar(
+        select(Wallet).where(Wallet.user_id == user_id).with_for_update()
+    )
     if not wallet:
         raise HTTPException(404, "Wallet not found")
     if wallet.status != "active":
         raise HTTPException(403, "Wallet is not active")
-    if float(wallet.balance) < body.amount:
-        raise HTTPException(400, "Insufficient wallet balance")
+    debit(wallet, body.amount)
 
     cfg = await _load_ach_config(db)
     tx_ref = str(uuid.uuid4())
@@ -971,8 +810,6 @@ async def ach_credit(
         raise HTTPException(exc.status_code, str(exc))
 
     # Debit wallet immediately — funds are reserved regardless of settlement status.
-    wallet.balance = float(wallet.balance) - body.amount
-
     tx = Transaction(
         transaction_ref=tx_ref,
         type="ach_credit",
