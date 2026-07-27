@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 
@@ -20,6 +21,11 @@ from config.database import get_db
 from middleware.auth import verify_token
 from models.user import User
 from models.wallet import MoneyRequest, Transaction, Wallet
+from models.wave_config import WaveConfig
+from services.wave import (
+    WaveClientConfig, WaveConfigError, WaveError, WaveUncertainError,
+    create_payout, verify_recipient,
+)
 from services.wallet_policy import credit, debit
 from utils import row_to_dict
 
@@ -57,6 +63,21 @@ AGENT_LOCATIONS = [
 ]
 
 router = APIRouter(tags=["transfer"])
+
+
+async def _wave_config(db: AsyncSession) -> WaveClientConfig:
+    config = await db.scalar(select(WaveConfig).where(WaveConfig.id == 1))
+    if not config or not config.enabled or not config.api_key:
+        raise WaveConfigError()
+    return WaveClientConfig(
+        base_url=config.api_base_url.rstrip("/"),
+        api_key=config.api_key,
+        business_country=config.business_country,
+        business_currency=config.business_currency,
+        aggregated_merchant_id=config.aggregated_merchant_id,
+        verify_recipient=config.verify_recipient,
+        enabled=config.enabled,
+    )
 
 TRANSFER_FEE_RATE = 0.015   # 1.5 % — global fallback (overridden by fee rules in DB)
 XOF_EUR_RATE = 655.957
@@ -407,6 +428,7 @@ async def check_wave_user(
     phone: str = Query(...),
     country: str = Query(None, description="Destination country name (for eligibility)"),
     token: dict = Depends(verify_token),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     Check whether a phone number is registered on Wave mobile money.
@@ -418,6 +440,24 @@ async def check_wave_user(
     Falls back to simulation (country-based) when no key is configured.
     """
     normalised = _normalise_phone(phone)
+    try:
+        config = await _wave_config(db)
+        result = await verify_recipient(
+            config, mobile=normalised, name=None, amount=1,
+            currency=config.business_currency,
+        )
+    except WaveError as exc:
+        raise HTTPException(exc.status_code, str(exc))
+    return {
+        "phone": normalised,
+        "has_wave": result.get("within_limits") is not False,
+        "country": country or config.business_country,
+        "wave_name": None,
+        "within_limits": result.get("within_limits"),
+        "name_match": result.get("name_match"),
+    }
+
+    # Legacy environment-key implementation retained below for compatibility.
     wave_api_key = os.getenv("WAVE_API_KEY", "")
 
     if wave_api_key:
@@ -499,7 +539,6 @@ async def cash_pickup(
 
     send_ccy = sender_wallet.currency
     recv_ccy = req.recv_currency.upper()
-
     from config.rate_config import calculate_fee
     fee_info = calculate_fee(send_ccy, recv_ccy, req.amount)
     fee      = fee_info["fee"]
@@ -599,6 +638,15 @@ async def wave_transfer(
 
     send_ccy = sender_wallet.currency
     recv_ccy = req.recv_currency.upper()
+    try:
+        config = await _wave_config(db)
+    except WaveConfigError as exc:
+        raise HTTPException(exc.status_code, str(exc))
+    if recv_ccy != config.business_currency.upper():
+        raise HTTPException(
+            400,
+            f"This Wave business wallet pays out {config.business_currency}, not {recv_ccy}.",
+        )
 
     from config.rate_config import calculate_fee
     fee_info = calculate_fee(send_ccy, recv_ccy, req.amount)
@@ -622,13 +670,30 @@ async def wave_transfer(
         else (req.recipient_name.strip() if req.recipient_name and req.recipient_name.strip() else recipient_phone)
     )
 
+    tx_ref = str(uuid_lib.uuid4())
+    if config.verify_recipient:
+        try:
+            verification = await verify_recipient(
+                config,
+                mobile=recipient_phone,
+                name=wave_recipient_name,
+                amount=received,
+                currency=recv_ccy,
+            )
+        except WaveError as exc:
+            raise HTTPException(exc.status_code, str(exc))
+        if verification.get("within_limits") is False:
+            raise HTTPException(422, "Wave recipient is over their wallet or inflow limit.")
+    else:
+        verification = None
+
     # Debit sender wallet
     debit(sender_wallet, req.amount)
 
     tx = Transaction(
-        transaction_ref=str(uuid_lib.uuid4()),
+        transaction_ref=tx_ref,
         type="wave_transfer",
-        status="pending",
+        status="processing",
         from_user_id=sender_id,
         from_phone=token["phone_number"],
         to_phone=recipient_phone,
@@ -646,13 +711,59 @@ async def wave_transfer(
             "net_send_amount": net_send,
             "received_amount": received,
             "recipient_name": wave_recipient_name,
+            "payout_provider": "wave",
+            "idempotency_key": tx_ref,
+            "wave_verification": verification,
         },
     )
     db.add(tx)
+    try:
+        payout = await create_payout(
+            config,
+            mobile=recipient_phone,
+            name=wave_recipient_name,
+            amount=received,
+            currency=recv_ccy,
+            client_reference=tx_ref,
+            payment_reason=req.description or "Kalipeh transfer",
+        )
+    except WaveUncertainError as exc:
+        tx.extra_data = {
+            **tx.extra_data,
+            "wave_error": str(exc),
+            "reconciliation_required": True,
+        }
+        await db.commit()
+        return JSONResponse(
+            status_code=202,
+            content={
+                "message": "Wave payout submitted; final status requires reconciliation",
+                "transaction_ref": tx_ref,
+                "status": "processing",
+            },
+        )
+    except WaveError as exc:
+        await db.rollback()
+        raise HTTPException(exc.status_code, str(exc))
+
+    wave_status = payout.get("status", "processing")
+    if wave_status == "failed":
+        await db.rollback()
+        error = payout.get("payout_error") or {}
+        raise HTTPException(422, error.get("error_message") or "Wave payout failed")
+    tx.status = "completed" if wave_status == "succeeded" else "processing"
+    tx.completed_at = datetime.utcnow() if wave_status == "succeeded" else None
+    tx.extra_data = {
+        **tx.extra_data,
+        "wave_payout_id": payout.get("id"),
+        "wave_status": wave_status,
+        "wave_fee": payout.get("fee"),
+        "wave_timestamp": payout.get("timestamp"),
+    }
     await db.commit()
 
     return {
-        "message": "Wave transfer queued",
+        "message": "Wave payout completed" if tx.status == "completed" else "Wave payout processing",
         "transaction_ref": tx.transaction_ref,
         "send_amount": req.amount,
         "send_currency": send_ccy,
@@ -662,4 +773,6 @@ async def wave_transfer(
         "recv_currency": recv_ccy,
         "recipient_name": wave_recipient_name,
         "to_phone": recipient_phone,
+        "status": tx.status,
+        "wave_payout_id": payout.get("id"),
     }

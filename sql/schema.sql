@@ -75,6 +75,37 @@ CREATE TABLE IF NOT EXISTS banks (
 	CONSTRAINT pk_banks PRIMARY KEY (id)
 );
 
+-- Reference list of countries used by nationality/country pickers
+CREATE TABLE IF NOT EXISTS countries (
+	id UUID NOT NULL,
+	code VARCHAR(2) NOT NULL,
+	name VARCHAR(100) NOT NULL,
+	dial VARCHAR(10),
+	flag VARCHAR(10),
+	currency VARCHAR(10),
+	is_active BOOLEAN DEFAULT 'true' NOT NULL,
+	created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+	updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+	CONSTRAINT pk_countries PRIMARY KEY (id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_countries_code ON countries (code);
+
+-- States/provinces/regions for a subset of priority countries
+CREATE TABLE IF NOT EXISTS regions (
+	id UUID NOT NULL,
+	country_code VARCHAR(2) NOT NULL,
+	name VARCHAR(100) NOT NULL,
+	code VARCHAR(10),
+	is_active BOOLEAN DEFAULT 'true' NOT NULL,
+	created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+	updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+	CONSTRAINT pk_regions PRIMARY KEY (id),
+	CONSTRAINT fk_regions_country_code_countries FOREIGN KEY(country_code) REFERENCES countries (code)
+);
+
+CREATE INDEX IF NOT EXISTS ix_regions_country_code ON regions (country_code);
+
 -- Admin-configured transfer fee rules (matched by currency pair / amount range)
 CREATE TABLE IF NOT EXISTS fee_rules (
 	id UUID NOT NULL,
@@ -225,6 +256,7 @@ CREATE TABLE IF NOT EXISTS kyc_submissions (
 	nationality VARCHAR(100) DEFAULT '' NOT NULL,
 	address VARCHAR(500) DEFAULT '' NOT NULL,
 	city VARCHAR(100) DEFAULT '' NOT NULL,
+	region VARCHAR(100) DEFAULT '' NOT NULL,
 	country VARCHAR(100) DEFAULT '' NOT NULL,
 	id_type VARCHAR(50) DEFAULT '' NOT NULL,
 	id_number VARCHAR(100) DEFAULT '' NOT NULL,

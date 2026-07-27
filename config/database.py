@@ -33,6 +33,9 @@ async def connect_db():
 
     if _is_supabase(url):
         ssl_ctx = ssl.create_default_context()
+        supabase_ca = os.path.join(os.path.dirname(__file__), "certs", "supabase-root-ca.pem")
+        if os.path.exists(supabase_ca):
+            ssl_ctx.load_verify_locations(cafile=supabase_ca)
         connect_args["ssl"] = ssl_ctx
 
     _engine = create_async_engine(

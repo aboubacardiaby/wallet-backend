@@ -26,6 +26,7 @@ class KYCSubmission(Base):
     nationality: Mapped[str] = mapped_column(String(100), nullable=False, server_default="")
     address: Mapped[str] = mapped_column(String(500), nullable=False, server_default="")
     city: Mapped[str] = mapped_column(String(100), nullable=False, server_default="")
+    region: Mapped[str] = mapped_column(String(100), nullable=False, server_default="")
     country: Mapped[str] = mapped_column(String(100), nullable=False, server_default="")
 
     # Document

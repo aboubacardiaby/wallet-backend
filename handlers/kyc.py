@@ -25,6 +25,7 @@ class KYCSubmitRequest(BaseModel):
     nationality: str
     address: str
     city: str
+    region: Optional[str] = ""
     country: str
     # Document
     id_type: str                # national_id | passport | drivers_license | residence_permit
@@ -96,6 +97,7 @@ async def submit_kyc(
         nationality=body.nationality,
         address=body.address,
         city=body.city,
+        region=body.region,
         country=body.country,
         id_type=body.id_type,
         id_number=body.id_number,
@@ -116,6 +118,7 @@ async def submit_kyc(
     user.national_id_number = body.id_number
     user.street = body.address
     user.city = body.city
+    user.region = body.region
     user.country = body.country
     user.kyc_status = "pending"
     user.updated_at = now

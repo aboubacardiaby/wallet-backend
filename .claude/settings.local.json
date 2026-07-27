@@ -18,7 +18,10 @@
       "Bash(tasklist:*)",
       "Bash(\"/c/projects/repos/wallet-backend/venv311/Scripts/python.exe\" -m uvicorn main:app --host 0.0.0.0 --port 8080)",
       "Bash(venv311/Scripts/python.exe -m pip install:*)",
-      "Bash(venv311/Scripts/python.exe:*)"
+      "Bash(venv311/Scripts/python.exe:*)",
+      "Bash(cmd.exe /c \"C:\\\\projects\\\\repos\\\\wallet-backend\\\\venv311\\\\Scripts\\\\pip.exe install debugpy && echo Done\")",
+      "Bash(docker exec wallet_schema_test *)",
+      "Bash(docker rm *)"
     ]
   }
 }

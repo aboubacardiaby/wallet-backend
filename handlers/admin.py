@@ -22,7 +22,7 @@ from config.database import get_db
 from config.runtime import jwt_secret
 from config.smtp import resolve_smtp, send_email, smtp_env, _send_sync
 from config.rate_config import (
-    calculate_fee, clear_rate_override, get_rate_override,
+    DEFAULT_FEE_RATE, calculate_fee, clear_rate_override, get_rate_override,
     load_from_db, refresh_fee_rules, set_rate_override,
 )
 from middleware.auth import require_role, verify_admin_token
@@ -31,7 +31,10 @@ from models.bank import Bank
 from models.fee_rule import FeeRule
 from models.kyc import KYCSubmission
 from models.rate_override import RateOverride
+from models.recipient import Recipient
+from handlers.recipient import normalized_country_code
 from models.ach_config import AchConfig
+from models.wave_config import WaveConfig
 from models.smtp_settings import SmtpConfig
 from models.user import User
 from models.wallet import Agent, Transaction, Wallet
@@ -295,6 +298,58 @@ async def update_user_status(
 
 
 # ── Wallets ───────────────────────────────────────────────────────────────────
+
+@router.get("/recipients")
+async def list_admin_recipients(
+    search: Optional[str] = Query(None),
+    country: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    token: dict = Depends(verify_admin_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """List saved recipients across all users, including their owning user."""
+    q = select(Recipient).order_by(Recipient.created_at.desc())
+    if search:
+        like = f"%{search}%"
+        q = q.where(
+            Recipient.full_name.ilike(like) |
+            Recipient.nickname.ilike(like) |
+            Recipient.phone_number.ilike(like)
+        )
+    if country:
+        q = q.where(
+            Recipient.country_name.ilike(f"%{country}%") |
+            Recipient.country_code.ilike(f"%{country}%")
+        )
+
+    total = await db.scalar(select(func.count()).select_from(q.subquery()))
+    rows = list(await db.scalars(q.offset((page - 1) * limit).limit(limit)))
+
+    owner_ids = {row.user_id for row in rows}
+    owner_map = {}
+    if owner_ids:
+        owners = await db.scalars(select(User).where(User.id.in_(owner_ids)))
+        owner_map = {owner.id: owner for owner in owners}
+
+    recipients = []
+    for row in rows:
+        item = row_to_dict(row)
+        item["country_code"] = normalized_country_code(
+            row.country_name, row.country_code, row.phone_number
+        )
+        owner = owner_map.get(row.user_id)
+        item["owner_name"] = owner.full_name if owner else None
+        item["owner_phone"] = owner.phone_number if owner else None
+        recipients.append(item)
+
+    return {
+        "recipients": recipients,
+        "total": total,
+        "page": page,
+        "pages": -(-total // limit),
+    }
+
 
 @router.get("/wallets")
 async def list_wallets(
@@ -863,7 +918,25 @@ async def list_fee_rules(
 ):
     rows = await db.scalars(select(FeeRule).order_by(FeeRule.priority.desc(), FeeRule.created_at))
     rules = [row_to_dict(r) for r in rows]
-    return {"rules": rules}
+    return {
+        "rules": rules,
+        "effective_default": {
+            "id": None,
+            "name": "Global default",
+            "from_currency": None,
+            "to_currency": None,
+            "fee_rate": DEFAULT_FEE_RATE,
+            "fee_flat": 0.0,
+            "min_fee": None,
+            "max_fee": None,
+            "min_amount": None,
+            "max_amount": None,
+            "priority": -1,
+            "is_active": True,
+            "note": "Built-in fallback used when no custom fee rule matches.",
+            "is_system_default": True,
+        },
+    }
 
 
 @router.post("/fees", status_code=status.HTTP_201_CREATED)
@@ -1443,3 +1516,81 @@ async def test_ach_config(db: AsyncSession = Depends(get_db)):
         raise HTTPException(400, f"ACH unreachable: {exc}")
     data = resp.json()["data"]
     return {"message": "Connection successful", "token_type": data.get("tokenType"), "expires_in": data.get("expiresIn")}
+
+
+# ── Wave payout configuration ─────────────────────────────────────────────────
+
+class WaveConfigRequest(BaseModel):
+    api_base_url: str = "https://api.wave.com"
+    api_key: str = ""
+    business_country: str = "Senegal"
+    business_currency: str = "XOF"
+    aggregated_merchant_id: str = ""
+    verify_recipient: bool = True
+    enabled: bool = False
+
+
+async def _get_or_create_wave(db: AsyncSession) -> WaveConfig:
+    config = await db.scalar(select(WaveConfig).where(WaveConfig.id == 1))
+    if not config:
+        config = WaveConfig(id=1)
+        db.add(config)
+        await db.flush()
+    return config
+
+
+def _wave_config_dict(config: WaveConfig) -> dict:
+    return {
+        "api_base_url": config.api_base_url,
+        "api_key": "••••••••" if config.api_key else "",
+        "api_key_configured": bool(config.api_key),
+        "business_country": config.business_country,
+        "business_currency": config.business_currency,
+        "aggregated_merchant_id": config.aggregated_merchant_id,
+        "verify_recipient": config.verify_recipient,
+        "enabled": config.enabled,
+        "updated_at": config.updated_at.isoformat() if config.updated_at else None,
+    }
+
+
+@router.get("/wave-config", dependencies=[Depends(require_role("super_admin"))])
+async def get_wave_config(db: AsyncSession = Depends(get_db)):
+    return _wave_config_dict(await _get_or_create_wave(db))
+
+
+@router.put("/wave-config", dependencies=[Depends(require_role("super_admin"))])
+async def update_wave_config(body: WaveConfigRequest, db: AsyncSession = Depends(get_db)):
+    config = await _get_or_create_wave(db)
+    config.api_base_url = body.api_base_url.rstrip("/")
+    config.business_country = body.business_country.strip()
+    config.business_currency = body.business_currency.upper().strip()
+    config.aggregated_merchant_id = body.aggregated_merchant_id.strip()
+    config.verify_recipient = body.verify_recipient
+    config.enabled = body.enabled
+    if body.api_key and body.api_key != "••••••••":
+        config.api_key = body.api_key.strip()
+    if config.enabled and not config.api_key:
+        raise HTTPException(400, "An API key is required before Wave payouts can be enabled")
+    config.updated_at = datetime.utcnow()
+    await db.commit()
+    return _wave_config_dict(config)
+
+
+@router.post("/wave-config/test", dependencies=[Depends(require_role("super_admin"))])
+async def test_wave_config(db: AsyncSession = Depends(get_db)):
+    import httpx as _httpx
+    config = await _get_or_create_wave(db)
+    if not config.api_key:
+        raise HTTPException(400, "No Wave API key configured")
+    try:
+        async with _httpx.AsyncClient(timeout=12) as client:
+            response = await client.get(
+                f"{config.api_base_url}/v1/balance",
+                headers={"Authorization": f"Bearer {config.api_key}"},
+            )
+            response.raise_for_status()
+    except _httpx.HTTPStatusError as exc:
+        raise HTTPException(400, f"Wave connection failed: {exc.response.text}")
+    except Exception as exc:
+        raise HTTPException(503, f"Wave API unreachable: {exc}")
+    return {"message": "Wave connection successful", "balance": response.json()}

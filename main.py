@@ -10,7 +10,7 @@ load_dotenv()
 
 from config.database import connect_db, database_ready, disconnect_db
 from config.runtime import cors_origins, jwt_secret
-from handlers import admin, auth, cash, exchange, kyc, notification, payment, qr, recipient, transfer, user, wallet
+from handlers import admin, auth, cash, country, exchange, kyc, notification, payment, qr, recipient, transfer, user, wallet
 from middleware.ratelimit import rate_limiter
 
 
@@ -76,6 +76,7 @@ app.include_router(notification.router, prefix=prefix)
 app.include_router(recipient.router, prefix=prefix)
 app.include_router(kyc.router, prefix=prefix)
 app.include_router(exchange.router, prefix=prefix)
+app.include_router(country.router, prefix=prefix)
 app.include_router(payment.router, prefix=prefix)
 app.include_router(admin.router, prefix=prefix)
 

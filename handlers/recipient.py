@@ -19,6 +19,52 @@ AVATAR_COLORS = [
     "#10b981", "#3b82f6", "#ef4444", "#14b8a6",
 ]
 
+COUNTRY_CODES = {
+    "benin": "BJ",
+    "burkina faso": "BF",
+    "cabo verde": "CV",
+    "cape verde": "CV",
+    "cote d'ivoire": "CI",
+    "côte d’ivoire": "CI",
+    "côte d'ivoire": "CI",
+    "gambia": "GM",
+    "ghana": "GH",
+    "guinea": "GN",
+    "guinea-bissau": "GW",
+    "liberia": "LR",
+    "mali": "ML",
+    "mauritania": "MR",
+    "niger": "NE",
+    "nigeria": "NG",
+    "senegal": "SN",
+    "sierra leone": "SL",
+    "togo": "TG",
+}
+
+PHONE_COUNTRY_CODES = {
+    "+220": "GM", "+221": "SN", "+223": "ML", "+224": "GN",
+    "+225": "CI", "+226": "BF", "+227": "NE", "+228": "TG",
+    "+229": "BJ", "+230": "MU", "+231": "LR", "+232": "SL",
+    "+233": "GH", "+234": "NG", "+238": "CV", "+245": "GW",
+}
+
+
+def normalized_country_code(
+    country_name: Optional[str],
+    country_code: Optional[str],
+    phone_number: Optional[str] = None,
+) -> str:
+    """Resolve an ISO alpha-2 code, preferring the selected country name."""
+    name_key = (country_name or "").strip().lower()
+    if name_key in COUNTRY_CODES:
+        return COUNTRY_CODES[name_key]
+    compact_phone = (phone_number or "").replace(" ", "").replace("-", "")
+    for prefix, iso_code in PHONE_COUNTRY_CODES.items():
+        if compact_phone.startswith(prefix):
+            return iso_code
+    code = (country_code or "").strip().upper()
+    return code if len(code) == 2 else "SN"
+
 
 class RecipientCreate(BaseModel):
     phone_number: str
@@ -81,7 +127,9 @@ async def add_recipient(
         full_name=body.full_name,
         nickname=body.nickname or "",
         avatar_color=AVATAR_COLORS[color_idx],
-        country_code=body.country_code or "SN",
+        country_code=normalized_country_code(
+            body.country_name, body.country_code, body.phone_number
+        ),
         country_name=body.country_name or "Senegal",
         created_at=datetime.utcnow(),
     )
@@ -114,9 +162,16 @@ async def update_recipient(
     if body.nickname is not None:
         r.nickname = body.nickname
     if body.country_code is not None:
-        r.country_code = body.country_code
+        r.country_code = normalized_country_code(
+            body.country_name or r.country_name,
+            body.country_code,
+            r.phone_number,
+        )
     if body.country_name is not None:
         r.country_name = body.country_name
+        r.country_code = normalized_country_code(
+            body.country_name, body.country_code or r.country_code, r.phone_number
+        )
     await db.commit()
     return {"message": "Recipient updated"}
 
