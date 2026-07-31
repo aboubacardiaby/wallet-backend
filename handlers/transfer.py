@@ -27,7 +27,7 @@ from services.wave import (
     create_payout, verify_recipient,
 )
 from services.wallet_policy import credit, debit
-from utils import row_to_dict
+from utils import normalise_phone as _normalise_phone_e164, row_to_dict
 
 # ── Static agent locations ────────────────────────────────────────────────────
 AGENT_LOCATIONS = [
@@ -89,16 +89,10 @@ WAVE_COUNTRIES = {"Senegal", "Côte d'Ivoire", "Mali", "Burkina Faso", "Guinea",
 # ── Phone helpers ────────────────────────────────────────────────────────────
 
 def _normalise_phone(raw: str) -> str:
-    cleaned = re.sub(r"[\s\-().]+", "", raw)
-    if cleaned and not cleaned.startswith("+"):
-        cleaned = "+" + cleaned
-    # Require E.164: + followed by 7–15 digits
-    if not re.fullmatch(r"\+\d{7,15}", cleaned):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid phone number '{raw}'. Use E.164 format, e.g. +221778689865.",
-        )
-    return cleaned
+    try:
+        return _normalise_phone_e164(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 async def _find_user_by_phone(phone_raw: str, db: AsyncSession):

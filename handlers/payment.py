@@ -3,6 +3,7 @@ Payment methods handler.
 Supports: card, bank_transfer (ACH / SEPA / SWIFT), paypal, apple_pay, google_pay.
 Top-up is simulated — in production wire Stripe / PayPal SDK here.
 """
+import re
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -30,7 +31,7 @@ from services.stripe_payment import (
     StripePaymentError,
     process_stripe_payment,
 )
-from utils import row_to_dict
+from utils import normalise_phone, row_to_dict
 
 router = APIRouter(tags=["payments"])
 VALID_TYPES = {"card", "bank_transfer", "paypal", "apple_pay", "google_pay"}
@@ -312,9 +313,13 @@ async def stripe_payment_endpoint(
         raise HTTPException(403, "Wallet is not active")
 
     # Build customer info
+    try:
+        phone_for_email = normalise_phone(user.phone_number)
+    except ValueError:
+        phone_for_email = re.sub(r"[^0-9A-Za-z]", "", user.phone_number) or "user"
     customer = StripeCustomerInfo(
         name=user.full_name or body.cardholder_name or "Unknown",
-        email=user.email or f"{user.phone_number}@wallet.local",
+        email=user.email or f"{phone_for_email}@wallet.local",
         phone=user.phone_number,
         metadata={
             "user_id": str(user_id),

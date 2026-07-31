@@ -1,8 +1,21 @@
+import re
 import uuid
 from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy.orm import DeclarativeBase
+
+_E164_RE = re.compile(r"\+\d{7,15}")
+
+
+def normalise_phone(raw: str) -> str:
+    """Strip formatting and enforce E.164 (+ followed by 7-15 digits). Raises ValueError if invalid."""
+    cleaned = re.sub(r"[\s\-().]+", "", raw)
+    if cleaned and not cleaned.startswith("+"):
+        cleaned = "+" + cleaned
+    if not _E164_RE.fullmatch(cleaned):
+        raise ValueError(f"Invalid phone number '{raw}'. Use E.164 format, e.g. +221778689865.")
+    return cleaned
 
 
 def row_to_dict(row: DeclarativeBase, exclude: tuple = ()) -> dict:

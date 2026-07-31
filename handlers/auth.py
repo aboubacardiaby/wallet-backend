@@ -15,6 +15,7 @@ from config.database import get_db
 from models.user import OTP, User
 from models.wallet import Wallet
 from config.runtime import jwt_secret
+from utils import normalise_phone
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,11 @@ def _generate_token(user_id: str, phone_number: str) -> str:
 
 @router.post("/register")
 async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    phone = req.phone_number if req.phone_number.startswith("+") else f"{req.country_code}{req.phone_number}"
+    raw_phone = req.phone_number if req.phone_number.startswith("+") else f"{req.country_code}{req.phone_number}"
+    try:
+        phone = normalise_phone(raw_phone)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
     existing = await db.scalar(select(User).where(User.phone_number == phone))
     if existing:
@@ -121,9 +126,14 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
 @router.post("/verify-otp")
 async def verify_otp(req: VerifyOTPRequest, db: AsyncSession = Depends(get_db)):
+    try:
+        phone = normalise_phone(req.phone_number)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
     otp_record = await db.scalar(
         select(OTP).where(
-            OTP.phone_number == req.phone_number,
+            OTP.phone_number == phone,
             OTP.purpose == "registration",
             OTP.verified == False,
         ).order_by(OTP.created_at.desc())
@@ -161,13 +171,17 @@ async def verify_otp(req: VerifyOTPRequest, db: AsyncSession = Depends(get_db)):
     db.add(wallet)
     await db.commit()
 
-    token = _generate_token(str(user.id), req.phone_number)
+    token = _generate_token(str(user.id), user.phone_number)
     return {"message": "Registration successful", "token": token, "user_id": str(user.id)}
 
 
 @router.post("/login")
 async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
-    user = await db.scalar(select(User).where(User.phone_number == req.phone_number))
+    try:
+        phone = normalise_phone(req.phone_number)
+    except ValueError:
+        phone = req.phone_number
+    user = await db.scalar(select(User).where(User.phone_number == phone))
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
