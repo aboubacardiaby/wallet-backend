@@ -30,6 +30,10 @@ class RegisterRequest(BaseModel):
 class VerifyOTPRequest(BaseModel):
     phone_number: str
     code: str
+    user_type: str = "receiver"
+    home_currency: str = "XOF"
+    full_name: str = ""
+    home_country: str = ""
 
 
 # Wallet limits per currency
@@ -138,8 +142,10 @@ async def verify_otp(req: VerifyOTPRequest, db: AsyncSession = Depends(get_db)):
         is_verified=True,
         kyc_status="pending",
         preferred_lang="fr",
-        user_type="receiver",
-        home_currency="XOF",
+        full_name=req.full_name,
+        user_type=req.user_type,
+        home_currency=req.home_currency.upper(),
+        country=req.home_country,
     )
     db.add(user)
     await db.flush()

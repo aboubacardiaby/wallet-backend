@@ -4,6 +4,7 @@ All endpoints require a valid admin JWT (is_admin=True claim).
 Role-based access: super_admin > manager > compliance | agent_supervisor > viewer
 """
 import asyncio
+import secrets
 import os
 import smtplib
 import uuid as uuid_lib
@@ -14,7 +15,7 @@ import bcrypt
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -28,6 +29,7 @@ from config.rate_config import (
 from middleware.auth import require_role, verify_admin_token
 from models.admin_user import AdminUser, ROLES
 from models.bank import Bank
+from models.country import Country
 from models.fee_rule import FeeRule
 from models.kyc import KYCSubmission
 from models.rate_override import RateOverride
@@ -531,6 +533,7 @@ async def list_transactions(
     search: Optional[str] = Query(None, description="Filter by phone or ref"),
     tx_type: Optional[str] = Query(None, alias="type"),
     tx_status: Optional[str] = Query(None, alias="status"),
+    destination_country: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     token: dict = Depends(verify_admin_token),
@@ -548,6 +551,33 @@ async def list_transactions(
             Transaction.from_phone.ilike(like) |
             Transaction.to_phone.ilike(like)
         )
+    if destination_country:
+        country_like = f"%{destination_country}%"
+        q = q.where(
+            or_(
+                Transaction.extra_data["agent_country"].as_string().ilike(country_like),
+                Transaction.extra_data["recipient_country"].as_string().ilike(country_like),
+                Transaction.extra_data["wave_verification"]["country"].as_string().ilike(country_like),
+                Transaction.to_user_id.in_(
+                    select(User.id).where(User.country.ilike(country_like))
+                ),
+                Transaction.to_phone.in_(
+                    select(User.phone_number).where(User.country.ilike(country_like))
+                ),
+                Transaction.to_phone.in_(
+                    select(Recipient.phone_number).where(
+                        Recipient.country_name.ilike(country_like)
+                    )
+                ),
+                select(Country.id)
+                .where(
+                    Country.name.ilike(country_like),
+                    Country.dial.isnot(None),
+                    Transaction.to_phone.startswith(Country.dial),
+                )
+                .exists(),
+            )
+        )
     total = await db.scalar(select(func.count()).select_from(q.subquery()))
     rows  = list(await db.scalars(q.offset((page - 1) * limit).limit(limit)))
 
@@ -558,10 +588,74 @@ async def list_transactions(
         users = await db.scalars(select(User).where(User.id.in_(sender_ids)))
         sender_map = {u.id: u.full_name for u in users}
 
+    receiver_ids = {t.to_user_id for t in rows if t.to_user_id}
+    receiver_phones = {t.to_phone for t in rows if t.to_phone}
+    receiver_country_by_id: dict = {}
+    receiver_country_by_phone: dict = {}
+    if receiver_ids or receiver_phones:
+        receiver_users = await db.scalars(
+            select(User).where(
+                or_(
+                    User.id.in_(receiver_ids) if receiver_ids else False,
+                    User.phone_number.in_(receiver_phones) if receiver_phones else False,
+                )
+            )
+        )
+        for user in receiver_users:
+            if user.country:
+                receiver_country_by_id[user.id] = user.country
+                receiver_country_by_phone[user.phone_number] = user.country
+
+    recipient_country_by_phone: dict = {}
+    if receiver_phones:
+        recipients = await db.scalars(
+            select(Recipient).where(Recipient.phone_number.in_(receiver_phones))
+        )
+        recipient_country_by_phone = {
+            recipient.phone_number: recipient.country_name
+            for recipient in recipients
+            if recipient.country_name
+        }
+
+    phone_country_by_phone: dict = {}
+    if receiver_phones:
+        countries = list(await db.scalars(select(Country).where(Country.dial.isnot(None))))
+        for phone in receiver_phones:
+            compact_phone = phone.replace(" ", "").replace("-", "")
+            matching_country = next(
+                (
+                    country
+                    for country in sorted(
+                        countries, key=lambda item: len(item.dial or ""), reverse=True
+                    )
+                    if country.dial
+                    and compact_phone.lstrip("+").startswith(country.dial.lstrip("+"))
+                ),
+                None,
+            )
+            if matching_country:
+                phone_country_by_phone[phone] = matching_country.name
+
     def enrich(t):
         d = row_to_dict(t)
-        d["sender_name"]    = sender_map.get(t.from_user_id) or None
-        d["recipient_name"] = (t.extra_data or {}).get("recipient_name") or None
+        extra = t.extra_data or {}
+        wave_verification = extra.get("wave_verification") or {}
+        d["sender_name"] = sender_map.get(t.from_user_id) or None
+        d["recipient_name"] = extra.get("recipient_name") or None
+        d["destination_country"] = (
+            extra.get("agent_country")
+            or extra.get("recipient_country")
+            or (
+                wave_verification.get("country")
+                if isinstance(wave_verification, dict)
+                else None
+            )
+            or receiver_country_by_id.get(t.to_user_id)
+            or receiver_country_by_phone.get(t.to_phone)
+            or recipient_country_by_phone.get(t.to_phone)
+            or phone_country_by_phone.get(t.to_phone)
+            or None
+        )
         return d
 
     return {
@@ -577,6 +671,7 @@ async def list_transactions(
 class CashPickupActionRequest(BaseModel):
     action: str           # assign | confirm | cancel
     agent_id: Optional[str] = None
+    pickup_code: Optional[str] = None
     admin_notes: Optional[str] = None
 
 
@@ -592,6 +687,11 @@ async def process_cash_pickup(
         raise HTTPException(status_code=404, detail="Transaction not found")
     if tx.type != "cash_pickup":
         raise HTTPException(status_code=400, detail="Transaction is not a cash pickup")
+    if tx.status in {"picked_up", "completed", "cancelled", "failed"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cash pickup is already in terminal status: {tx.status}",
+        )
 
     extra = tx.extra_data or {}
 
@@ -615,11 +715,25 @@ async def process_cash_pickup(
         }
 
     elif body.action == "confirm":
-        if tx.status != "ready_for_pickup":
-            raise HTTPException(status_code=400, detail="Transaction must be ready_for_pickup to confirm")
+        if tx.status not in {"pending", "ready_for_pickup"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Transaction must be pending or ready_for_pickup to confirm",
+            )
+        expected_code = str(extra.get("pickup_code") or "")
+        provided_code = (body.pickup_code or "").strip()
+        if not expected_code or not provided_code:
+            raise HTTPException(status_code=400, detail="Pickup code is required")
+        if not secrets.compare_digest(provided_code, expected_code):
+            raise HTTPException(status_code=403, detail="Invalid pickup code")
         tx.status = "picked_up"
         tx.completed_at = datetime.utcnow()
-        tx.extra_data = {**extra, "admin_notes": body.admin_notes or extra.get("admin_notes")}
+        tx.extra_data = {
+            **extra,
+            "admin_notes": body.admin_notes or extra.get("admin_notes"),
+            "paid_by_admin": token.get("sub"),
+            "paid_at": tx.completed_at.isoformat(),
+        }
 
     elif body.action == "cancel":
         tx.status = "cancelled"

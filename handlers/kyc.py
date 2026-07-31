@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -113,7 +113,10 @@ async def submit_kyc(
 
     # Sync personal info back to user profile
     user.full_name = body.full_name
-    user.date_of_birth = datetime.strptime(body.date_of_birth, "%Y-%m-%d") if body.date_of_birth else None
+    user.date_of_birth = (
+        datetime.strptime(body.date_of_birth, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if body.date_of_birth else None
+    )
     user.national_id_type = body.id_type
     user.national_id_number = body.id_number
     user.street = body.address

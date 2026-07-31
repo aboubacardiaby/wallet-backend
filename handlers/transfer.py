@@ -692,8 +692,8 @@ async def wave_transfer(
 
     tx = Transaction(
         transaction_ref=tx_ref,
-        type="wave_transfer",
-        status="processing",
+        type="wave_pickup",
+        status="pending",
         from_user_id=sender_id,
         from_phone=token["phone_number"],
         to_phone=recipient_phone,
@@ -739,7 +739,7 @@ async def wave_transfer(
             content={
                 "message": "Wave payout submitted; final status requires reconciliation",
                 "transaction_ref": tx_ref,
-                "status": "processing",
+                "status": "pending",
             },
         )
     except WaveError as exc:
@@ -751,8 +751,6 @@ async def wave_transfer(
         await db.rollback()
         error = payout.get("payout_error") or {}
         raise HTTPException(422, error.get("error_message") or "Wave payout failed")
-    tx.status = "completed" if wave_status == "succeeded" else "processing"
-    tx.completed_at = datetime.utcnow() if wave_status == "succeeded" else None
     tx.extra_data = {
         **tx.extra_data,
         "wave_payout_id": payout.get("id"),
@@ -763,7 +761,7 @@ async def wave_transfer(
     await db.commit()
 
     return {
-        "message": "Wave payout completed" if tx.status == "completed" else "Wave payout processing",
+        "message": "Wave payout submitted",
         "transaction_ref": tx.transaction_ref,
         "send_amount": req.amount,
         "send_currency": send_ccy,

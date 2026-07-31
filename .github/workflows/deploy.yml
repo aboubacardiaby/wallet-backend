@@ -84,3 +84,5 @@ jobs:
           env_vars: |
             DATABASE_URL=${{ secrets.DATABASE_URL }}
             JWT_SECRET=${{ secrets.JWT_SECRET }}
+            APP_ENV=production
+            CORS_ORIGINS=${{ vars.ADMINWEB_ORIGIN }}
