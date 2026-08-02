@@ -5,6 +5,8 @@ import random
 import uuid as uuid_lib
 from datetime import datetime, timedelta, timezone
 
+_DEBUG_OTP_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "debug_otp.txt")
+
 import bcrypt
 import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -13,10 +15,10 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import get_db
+from config.runtime import is_production, jwt_secret
 from models.refresh_token import RefreshToken
 from models.user import OTP, User
 from models.wallet import Wallet
-from config.runtime import jwt_secret
 from utils import normalise_phone
 
 logger = logging.getLogger(__name__)
@@ -101,6 +103,7 @@ def _generate_token(user_id: str, phone_number: str) -> str:
 
 @router.post("/register")
 async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    print(f"[DEBUG] /register hit with phone={req.phone_number}, country={req.country_code}", flush=True)
     raw_phone = req.phone_number if req.phone_number.startswith("+") else f"{req.country_code}{req.phone_number}"
     try:
         phone = normalise_phone(raw_phone)
@@ -121,9 +124,21 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     db.add(otp)
     await db.commit()
 
+    # DEBUG: print the OTP code so it is visible during development/testing.
+    print(f"[DEBUG] OTP code for {phone}: {otp_code}", flush=True)
+    logger.info(f"[DEBUG] OTP code for {phone}: {otp_code}")
+
+    # Also write to a debug file so it can be found even if uvicorn swallows stdout.
+    try:
+        with open(_DEBUG_OTP_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat()} - {phone} - {otp_code}\n")
+    except Exception:
+        pass
+
     _send_otp_sms(phone, otp_code)
 
-    return {"message": "OTP sent successfully"}
+    # DEBUG: always return the OTP for visibility during local testing.
+    return {"message": "OTP sent successfully", "debug_otp": otp_code}
 
 
 @router.post("/verify-otp")
