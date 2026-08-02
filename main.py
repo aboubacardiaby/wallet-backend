@@ -18,7 +18,9 @@ from middleware.ratelimit import rate_limiter
 async def lifespan(app: FastAPI):
     jwt_secret()
     if is_production() and not cors_origins():
-        raise RuntimeError("CORS_ORIGINS must be configured in production")
+        import logging
+        logger = logging.getLogger("kalipeh")
+        logger.warning("CORS_ORIGINS is not configured in production; CORS will be disabled")
     await connect_db()
     # Pre-load rate overrides and fee rules into memory
     from config.database import _SessionLocal
