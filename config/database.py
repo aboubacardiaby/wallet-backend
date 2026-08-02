@@ -42,6 +42,10 @@ async def connect_db():
         url,
         echo=False,
         pool_pre_ping=True,
+        pool_size=int(os.getenv("DB_POOL_SIZE", 20)),
+        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", 10)),
+        pool_recycle=int(os.getenv("DB_POOL_RECYCLE", 3600)),
+        pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", 30)),
         connect_args=connect_args,
     )
     _SessionLocal = async_sessionmaker(_engine, expire_on_commit=False)
@@ -58,9 +62,13 @@ async def connect_db():
     # Auto-create any missing tables (safe — does not drop or alter existing ones)
     try:
         from models.base import Base
-        import models.bank          # noqa: F401
-        import models.rate_override # noqa: F401
-        import models.fee_rule      # noqa: F401
+        import models.app_settings  # noqa: F401
+        import models.audit_log      # noqa: F401
+        import models.bank           # noqa: F401
+        import models.rate_limit     # noqa: F401
+        import models.rate_override  # noqa: F401
+        import models.refresh_token  # noqa: F401
+        import models.fee_rule       # noqa: F401
         async with _engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
     except Exception as e:

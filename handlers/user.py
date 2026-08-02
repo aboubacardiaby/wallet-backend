@@ -4,7 +4,7 @@ from typing import Any, Dict
 
 import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,9 +41,23 @@ class SetPINRequest(BaseModel):
     pin: str
     confirm_pin: str
 
+    @field_validator("pin", "confirm_pin")
+    @classmethod
+    def _validate_pin(cls, v: str) -> str:
+        if not v.isdigit() or not (4 <= len(v) <= 6):
+            raise ValueError("PIN must be 4-6 digits")
+        return v
+
 
 class VerifyPINRequest(BaseModel):
     pin: str
+
+    @field_validator("pin")
+    @classmethod
+    def _validate_pin(cls, v: str) -> str:
+        if not v.isdigit() or not (4 <= len(v) <= 6):
+            raise ValueError("PIN must be 4-6 digits")
+        return v
 
 
 async def _get_user_or_404(user_id: str, db: AsyncSession) -> User:
@@ -82,8 +96,6 @@ async def set_pin(
     token: dict = Depends(verify_token),
     db: AsyncSession = Depends(get_db),
 ):
-    if len(req.pin) != 4 or not req.pin.isdigit():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="PIN must be 4 digits")
     if req.pin != req.confirm_pin:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="PINs do not match")
 

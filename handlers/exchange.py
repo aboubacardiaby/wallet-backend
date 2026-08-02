@@ -55,6 +55,10 @@ async def _fetch_rates(base: str) -> dict:
             resp.raise_for_status()
             data = resp.json()
     except Exception as exc:
+        # If we have any cached data (even stale), serve it instead of failing.
+        stale = _cache.get(base)
+        if stale:
+            return {**stale, "source": "stale-cache"}
         raise HTTPException(status_code=503, detail=f"Exchange rate service unavailable: {exc}")
 
     raw_rates = data.get("rates", {})

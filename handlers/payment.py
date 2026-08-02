@@ -796,6 +796,8 @@ async def ach_credit(
     if wallet.status != "active":
         raise HTTPException(403, "Wallet is not active")
     debit(wallet, body.amount)
+    db.add(wallet)
+    db.flush()
 
     cfg = await _load_ach_config(db)
     tx_ref = str(uuid.uuid4())
@@ -812,9 +814,11 @@ async def ach_credit(
             description=f"Wallet payout ****{body.account_number[-4:]}",
         )
     except (ACHError, ACHConfigError) as exc:
+        # Roll back the pending wallet debit since the ACH call failed.
+        await db.rollback()
         raise HTTPException(exc.status_code, str(exc))
 
-    # Debit wallet immediately — funds are reserved regardless of settlement status.
+    # Wallet is debited after the ACH API accepts the request.
     tx = Transaction(
         transaction_ref=tx_ref,
         type="ach_credit",

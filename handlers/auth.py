@@ -2,16 +2,18 @@ import hashlib
 import logging
 import os
 import random
+import uuid as uuid_lib
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import get_db
+from models.refresh_token import RefreshToken
 from models.user import OTP, User
 from models.wallet import Wallet
 from config.runtime import jwt_secret
@@ -145,7 +147,8 @@ async def verify_otp(req: VerifyOTPRequest, db: AsyncSession = Depends(get_db)):
     if otp_record.code != _hash_otp(req.code.strip()):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Incorrect OTP code.")
 
-    otp_record.verified = True
+    # Delete the OTP record so it cannot be replayed.
+    await db.delete(otp_record)
 
     user = User(
         phone_number=otp_record.phone_number,
@@ -172,7 +175,11 @@ async def verify_otp(req: VerifyOTPRequest, db: AsyncSession = Depends(get_db)):
     await db.commit()
 
     token = _generate_token(str(user.id), user.phone_number)
-    return {"message": "Registration successful", "token": token, "user_id": str(user.id)}
+    refresh_plain, refresh_record = RefreshToken.create(user.id)
+    db.add(refresh_record)
+    await db.commit()
+
+    return {"message": "Registration successful", "token": token, "refresh_token": refresh_plain, "user_id": str(user.id)}
 
 
 @router.post("/login")
@@ -200,9 +207,14 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
     await db.commit()
 
     token = _generate_token(str(user.id), user.phone_number)
+    refresh_plain, refresh_record = RefreshToken.create(user.id)
+    db.add(refresh_record)
+    await db.commit()
+
     return {
         "message": "Login successful",
         "token": token,
+        "refresh_token": refresh_plain,
         "user": {
             "id": str(user.id),
             "phone_number": user.phone_number,
@@ -214,5 +226,35 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/refresh")
-async def refresh_token():
-    return {"message": "Token refreshed"}
+async def refresh_token(
+    refresh_token: str = Header(..., alias="X-Refresh-Token"),
+    db: AsyncSession = Depends(get_db),
+):
+    token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+    row = await db.scalar(
+        select(RefreshToken)
+        .where(
+            RefreshToken.token_hash == token_hash,
+            RefreshToken.used_at.is_(None),
+            RefreshToken.expires_at > datetime.utcnow(),
+        )
+    )
+    if not row:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token")
+
+    user = await db.scalar(select(User).where(User.id == row.user_id))
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+
+    row.used_at = datetime.utcnow()
+    access_token = _generate_token(str(user.id), user.phone_number)
+    new_refresh_plain, new_refresh_record = RefreshToken.create(user.id)
+    db.add(new_refresh_record)
+    await db.commit()
+
+    return {
+        "message": "Token refreshed",
+        "token": access_token,
+        "refresh_token": new_refresh_plain,
+        "user_id": str(user.id),
+    }

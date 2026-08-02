@@ -1,8 +1,9 @@
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +13,7 @@ from middleware.auth import require_role, verify_token
 from models.kyc import KYCSubmission
 from models.user import User
 from utils import row_to_dict
+from utils.audit import log_audit
 
 router = APIRouter(tags=["kyc"])
 
@@ -42,7 +44,40 @@ class KYCReviewRequest(BaseModel):
     reviewer_id: str            # admin identifier (e.g. email or "admin")
 
 
-# ── Helper ──────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+_ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
+_MAX_DOC_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def _validate_doc_url(value: str, field: str) -> None:
+    if not value:
+        raise HTTPException(status_code=422, detail=f"{field} is required")
+    # Plain HTTPS URLs (e.g. S3 pre-signed) are allowed but validated loosely
+    if value.startswith("https://"):
+        if len(value) > 4096:
+            raise HTTPException(status_code=422, detail=f"{field} URL is too long")
+        return
+    # Expect a data-URI upload
+    m = re.match(r"^data:([^;]+);base64,([A-Za-z0-9+/=]+)$", value)
+    if not m:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field} must be a base64 data URI or HTTPS URL",
+        )
+    mime, b64 = m.group(1), m.group(2)
+    if mime not in _ALLOWED_MIME:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field} has unsupported file type: {mime}. Allowed: {', '.join(_ALLOWED_MIME)}",
+        )
+    # base64 string length * 0.75 is an upper-bound on raw byte size
+    if len(b64) * 0.75 > _MAX_DOC_BYTES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field} exceeds 5 MB limit",
+        )
+
 
 async def _latest_submission(user_id: uuid.UUID, db: AsyncSession) -> Optional[KYCSubmission]:
     return await db.scalar(
@@ -82,6 +117,10 @@ async def submit_kyc(
 
     if user.kyc_status == "verified":
         raise HTTPException(status_code=400, detail="KYC already verified")
+
+    _validate_doc_url(body.id_front_url, "id_front_url")
+    _validate_doc_url(body.id_back_url, "id_back_url")
+    _validate_doc_url(body.selfie_url, "selfie_url")
 
     # If there is an existing pending/under_review submission, replace it
     existing = await _latest_submission(user_id, db)
@@ -151,6 +190,7 @@ async def list_kyc_submissions(
 async def review_kyc(
     submission_id: str,
     body: KYCReviewRequest,
+    request: Request,
     token: dict = Depends(require_role("super_admin", "compliance")),
     db: AsyncSession = Depends(get_db),
 ):
@@ -181,4 +221,19 @@ async def review_kyc(
         user.updated_at = now
 
     await db.commit()
+
+    await log_audit(
+        db,
+        action=f"kyc_{body.action}",
+        actor_id=token.get("user_id") or body.reviewer_id,
+        resource_type="kyc_submission",
+        resource_id=submission_id,
+        details={
+            "reviewer_id": body.reviewer_id,
+            "rejection_reason": body.rejection_reason,
+            "user_id": str(user.id) if user else None,
+        },
+        ip_address=request.client.host if request.client else None,
+    )
+
     return {"message": f"KYC {new_status}", "submission_id": submission_id, "status": new_status}

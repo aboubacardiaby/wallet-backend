@@ -9,7 +9,7 @@ import os
 import smtplib
 import uuid as uuid_lib
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 import bcrypt
 import jwt
@@ -37,6 +37,7 @@ from models.recipient import Recipient
 from handlers.recipient import normalized_country_code
 from models.ach_config import AchConfig
 from models.wave_config import WaveConfig
+from models.app_settings import AppSetting
 from models.smtp_settings import SmtpConfig
 from models.user import User
 from models.wallet import Agent, Transaction, Wallet
@@ -53,8 +54,8 @@ def _check_pw(password: str, hashed: str) -> bool:
 
 router = APIRouter(tags=["admin"], prefix="/admin")
 
-# ── In-memory app settings (replace with DB table for persistence) ─────────
-_settings: dict = {
+# ── App settings defaults ───────────────────────────────────────────────────
+_DEFAULT_SETTINGS: dict = {
     "transfer_fee_rate":   0.015,
     "daily_limit_default":   500_000.0,
     "monthly_limit_default": 2_000_000.0,
@@ -65,6 +66,34 @@ _settings: dict = {
     "support_email":         "support@kalipeh.com",
     "app_name":              "Kalipeh Wallet",
 }
+
+
+async def _load_settings(db: AsyncSession) -> dict:
+    rows = list(await db.scalars(select(AppSetting)))
+    stored = {r.key: r.value for r in rows}
+    return {**_DEFAULT_SETTINGS, **stored}
+
+
+async def _save_settings(db: AsyncSession, updates: dict) -> dict:
+    for key, value in updates.items():
+        if key not in _DEFAULT_SETTINGS:
+            continue
+        existing = await db.scalar(select(AppSetting).where(AppSetting.key == key))
+        if existing:
+            existing.value = _coerce_setting(key, value)
+        else:
+            db.add(AppSetting(key=key, value=_coerce_setting(key, value)))
+    await db.commit()
+    return await _load_settings(db)
+
+
+def _coerce_setting(key: str, value) -> Any:
+    default = _DEFAULT_SETTINGS.get(key)
+    if isinstance(default, bool):
+        return bool(value)
+    if isinstance(default, (int, float)):
+        return float(value)
+    return str(value)
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
@@ -530,10 +559,10 @@ async def delete_bank(
 
 @router.get("/transactions")
 async def list_transactions(
-    search: Optional[str] = Query(None, description="Filter by phone or ref"),
-    tx_type: Optional[str] = Query(None, alias="type"),
-    tx_status: Optional[str] = Query(None, alias="status"),
-    destination_country: Optional[str] = Query(None),
+    search: Optional[str] = Query(None, max_length=100, description="Filter by phone or ref"),
+    tx_type: Optional[str] = Query(None, alias="type", max_length=50),
+    tx_status: Optional[str] = Query(None, alias="status", max_length=50),
+    destination_country: Optional[str] = Query(None, max_length=100),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     token: dict = Depends(verify_admin_token),
@@ -544,20 +573,23 @@ async def list_transactions(
         q = q.where(Transaction.type == tx_type)
     if tx_status:
         q = q.where(Transaction.status == tx_status)
+    def _esc(s: str) -> str:
+        return s.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
     if search:
-        like = f"%{search}%"
+        like = f"%{_esc(search)}%"
         q = q.where(
-            Transaction.transaction_ref.ilike(like) |
-            Transaction.from_phone.ilike(like) |
-            Transaction.to_phone.ilike(like)
+            Transaction.transaction_ref.ilike(like, escape='\\') |
+            Transaction.from_phone.ilike(like, escape='\\') |
+            Transaction.to_phone.ilike(like, escape='\\')
         )
     if destination_country:
-        country_like = f"%{destination_country}%"
+        country_like = f"%{_esc(destination_country)}%"
         q = q.where(
             or_(
-                Transaction.extra_data["agent_country"].as_string().ilike(country_like),
-                Transaction.extra_data["recipient_country"].as_string().ilike(country_like),
-                Transaction.extra_data["wave_verification"]["country"].as_string().ilike(country_like),
+                Transaction.extra_data["agent_country"].as_string().ilike(country_like, escape='\\'),
+                Transaction.extra_data["recipient_country"].as_string().ilike(country_like, escape='\\'),
+                Transaction.extra_data["wave_verification"]["country"].as_string().ilike(country_like, escape='\\'),
                 Transaction.to_user_id.in_(
                     select(User.id).where(User.country.ilike(country_like))
                 ),
@@ -831,19 +863,20 @@ async def list_kyc(
 # ── Settings ──────────────────────────────────────────────────────────────────
 
 @router.get("/settings")
-async def get_settings(token: dict = Depends(verify_admin_token)):
-    return _settings
+async def get_settings(
+    token: dict = Depends(verify_admin_token),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _load_settings(db)
 
 
 @router.put("/settings")
 async def update_settings(
     body: SettingsUpdateRequest,
     token: dict = Depends(require_role("super_admin")),
+    db: AsyncSession = Depends(get_db),
 ):
-    for field, value in body.model_dump(exclude_none=True).items():
-        if field in _settings:
-            _settings[field] = value
-    return _settings
+    return await _save_settings(db, body.model_dump(exclude_none=True))
 
 
 # ── Rate override schemas ─────────────────────────────────────────────────────

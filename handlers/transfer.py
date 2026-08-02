@@ -9,7 +9,7 @@ import uuid as uuid_lib
 from datetime import datetime, timedelta
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -121,6 +121,28 @@ async def _find_user_by_phone(phone_raw: str, db: AsyncSession):
             return user
 
     return None
+
+
+# ── Idempotency helper ─────────────────────────────────────────────────────────
+
+_IDEMPOTENCY_TTL = timedelta(hours=24)
+
+
+async def _dedupe_idempotency(db: AsyncSession, from_user_id: uuid_lib.UUID, key: str | None):
+    """Return an existing transaction if the idempotency key was already used."""
+    if not key:
+        return None
+    since = datetime.utcnow() - _IDEMPOTENCY_TTL
+    tx = await db.scalar(
+        select(Transaction)
+        .where(
+            Transaction.from_user_id == from_user_id,
+            Transaction.created_at >= since,
+            Transaction.extra_data["idempotency_key"].as_string() == key,
+        )
+        .order_by(Transaction.created_at.desc())
+    )
+    return tx
 
 
 # ── Exchange rate helper ─────────────────────────────────────────────────────
@@ -273,6 +295,7 @@ async def get_quote(
 @router.post("/transfer/send")
 async def send_money(
     req: SendMoneyRequest,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     token: dict = Depends(verify_token),
     db: AsyncSession = Depends(get_db),
 ):
@@ -280,6 +303,21 @@ async def send_money(
         raise HTTPException(status_code=400, detail="Amount must be positive")
 
     sender_id = uuid_lib.UUID(token["user_id"])
+
+    existing = await _dedupe_idempotency(db, sender_id, idempotency_key)
+    if existing:
+        return {
+            "message": "Transfer successful",
+            "transaction_ref": existing.transaction_ref,
+            "send_amount": existing.amount,
+            "send_currency": existing.currency,
+            "fee": existing.fee,
+            "exchange_rate": existing.extra_data.get("exchange_rate", 1.0),
+            "received_amount": existing.extra_data.get("received_amount", existing.amount),
+            "recv_currency": existing.extra_data.get("recv_currency", existing.currency),
+            "recipient_name": existing.extra_data.get("recipient_name", existing.to_phone),
+            "to_phone": existing.to_phone,
+        }
 
     recipient = await _find_user_by_phone(req.to_phone, db)
     if not recipient:
@@ -348,6 +386,7 @@ async def send_money(
             "net_send_amount": net_send,
             "received_amount": received,
             "recipient_name": recipient.full_name or req.to_phone,
+            "idempotency_key": idempotency_key,
         },
     )
     db.add(tx)
@@ -556,8 +595,11 @@ async def cash_pickup(
     # Generate 6-digit pickup PIN
     pickup_code = f"{random.randint(0, 999999):06d}"
 
-    # Debit sender wallet
+    # Debit sender wallet and bind the change to this transaction so a rollback
+    # will restore the balance if the payout fails.
     debit(sender_wallet, req.amount)
+    db.add(sender_wallet)
+    db.flush()
 
     tx = Transaction(
         transaction_ref=str(uuid_lib.uuid4()),
@@ -681,8 +723,11 @@ async def wave_transfer(
     else:
         verification = None
 
-    # Debit sender wallet
+    # Debit sender wallet and bind the change to this transaction so a rollback
+    # will restore the balance if the payout fails.
     debit(sender_wallet, req.amount)
+    db.add(sender_wallet)
+    db.flush()
 
     tx = Transaction(
         transaction_ref=tx_ref,

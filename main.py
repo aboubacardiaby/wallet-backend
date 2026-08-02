@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 load_dotenv()
 
 from config.database import connect_db, database_ready, disconnect_db
-from config.runtime import cors_origins, jwt_secret
+from config.runtime import cors_origins, is_production, jwt_secret
 from handlers import admin, auth, cash, country, exchange, kyc, notification, payment, qr, recipient, transfer, user, wallet
 from middleware.ratelimit import rate_limiter
 
@@ -17,6 +17,8 @@ from middleware.ratelimit import rate_limiter
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     jwt_secret()
+    if is_production() and not cors_origins():
+        raise RuntimeError("CORS_ORIGINS must be configured in production")
     await connect_db()
     # Pre-load rate overrides and fee rules into memory
     from config.database import _SessionLocal

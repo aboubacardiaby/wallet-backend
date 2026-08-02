@@ -1,45 +1,70 @@
-import time
-import threading
+import asyncio
+from datetime import datetime, timedelta
+
 from fastapi import HTTPException, Request, status
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-_visitors: dict = {}
-_lock = threading.Lock()
+from config.database import _SessionLocal
+from models.rate_limit import RateLimit
+
+_LIMIT = 100            # requests per window
+_WINDOW = 60            # seconds
+_CLEANUP_EVERY = 100    # approximate requests between DB cleanups
+_request_count = 0
+_lock = asyncio.Lock()
 
 
-def _cleanup_visitors():
-    now = time.time()
-    with _lock:
-        stale = [ip for ip, v in _visitors.items() if now - v["last_seen"] > 180]
-        for ip in stale:
-            del _visitors[ip]
+async def _cleanup_old(db: AsyncSession) -> None:
+    """Remove rate limit rows that are outside the active window."""
+    cutoff = datetime.utcnow() - timedelta(seconds=_WINDOW)
+    await db.execute(delete(RateLimit).where(RateLimit.window_start < cutoff))
+    await db.commit()
 
 
 async def rate_limiter(request: Request):
     ip = request.client.host
-    now = time.time()
+    now = datetime.utcnow()
+    window_start = now.replace(second=0, microsecond=0)
 
-    with _lock:
-        visitor = _visitors.get(ip)
+    if _SessionLocal is None:
+        # DB is not ready; allow the request through.
+        return
 
-        if visitor is None:
-            _visitors[ip] = {"last_seen": now, "count": 1}
+    async with _SessionLocal() as db:
+        row = await db.scalar(select(RateLimit).where(RateLimit.ip_address == ip))
+
+        if not row or row.window_start < window_start:
+            # New window for this IP.
+            if row:
+                row.count = 1
+                row.window_start = window_start
+                row.last_seen = now
+            else:
+                db.add(RateLimit(ip_address=ip, count=1, window_start=window_start, last_seen=now))
+            await db.commit()
             return
 
-        # Reset count if more than 1 minute has passed
-        if now - visitor["last_seen"] > 60:
-            visitor["count"] = 1
-            visitor["last_seen"] = now
-            return
-
-        if visitor["count"] > 100:
+        if row.count > _LIMIT:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Rate limit exceeded. Try again later.",
             )
 
-        visitor["count"] += 1
-        visitor["last_seen"] = now
+        row.count += 1
+        row.last_seen = now
+        await db.commit()
 
-    # Periodic cleanup (every ~50 requests, non-blocking)
-    if int(now) % 180 == 0:
-        threading.Thread(target=_cleanup_visitors, daemon=True).start()
+    # Periodic cleanup of expired windows.
+    global _request_count
+    async with _lock:
+        _request_count += 1
+        if _request_count % _CLEANUP_EVERY == 0:
+            asyncio.create_task(_cleanup_expired_windows())
+
+
+async def _cleanup_expired_windows() -> None:
+    if _SessionLocal is None:
+        return
+    async with _SessionLocal() as db:
+        await _cleanup_old(db)

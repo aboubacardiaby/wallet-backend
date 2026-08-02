@@ -101,7 +101,7 @@ async def create_payout(
     if config.aggregated_merchant_id:
         payload["aggregated_merchant_id"] = config.aggregated_merchant_id
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=8) as client:
             response = await client.post(
                 f"{config.base_url}/v1/payout",
                 headers=_headers(config, client_reference),
