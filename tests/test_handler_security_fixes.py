@@ -11,6 +11,7 @@ from models.user import User
 from services.ach import ACHResult, AchClientConfig
 
 
+
 class FakeDB:
     """Minimal AsyncSession stand-in: records every statement passed to
     scalar() and always returns a preset object, regardless of the query."""
