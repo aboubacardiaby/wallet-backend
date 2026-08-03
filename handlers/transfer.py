@@ -599,7 +599,7 @@ async def cash_pickup(
     # will restore the balance if the payout fails.
     debit(sender_wallet, req.amount)
     db.add(sender_wallet)
-    db.flush()
+    await db.flush()
 
     tx = Transaction(
         transaction_ref=str(uuid_lib.uuid4()),
@@ -727,7 +727,7 @@ async def wave_transfer(
     # will restore the balance if the payout fails.
     debit(sender_wallet, req.amount)
     db.add(sender_wallet)
-    db.flush()
+    await db.flush()
 
     tx = Transaction(
         transaction_ref=tx_ref,

@@ -797,7 +797,7 @@ async def ach_credit(
         raise HTTPException(403, "Wallet is not active")
     debit(wallet, body.amount)
     db.add(wallet)
-    db.flush()
+    await db.flush()
 
     cfg = await _load_ach_config(db)
     tx_ref = str(uuid.uuid4())

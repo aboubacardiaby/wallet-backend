@@ -54,6 +54,7 @@ class SenderNotifyRequest(BaseModel):
     recipient_name:  Optional[str]   = None
     exchange_rate:   Optional[float] = None
     pickup_code:     Optional[str]   = None
+    wave_ref:        Optional[str]   = None
 
 
 class SendEmailRequest(BaseModel):
@@ -218,39 +219,72 @@ async def transfer_email(
     Send a transfer confirmation email to the sender.
     Non-blocking — returns 200 even if SMTP is not configured.
     """
-    user_id = uuid_lib.UUID(token["user_id"])
-    user = await db.scalar(select(User).where(User.id == user_id))
-    if not user or not user.email:
-        return {"message": "No email on file"}
+    try:
+        user_id = uuid_lib.UUID(token["user_id"])
+        user = await db.scalar(select(User).where(User.id == user_id))
+        if not user or not user.email:
+            return {"message": "No email on file"}
 
-    smtp = await resolve_smtp(db)
-    if smtp.get("host") and smtp.get("from_email"):
+        smtp = await resolve_smtp(db)
+        if not smtp.get("host") or not smtp.get("from_email") or not smtp.get("enabled", True):
+            return {"message": "SMTP not configured"}
+
         amt_line = (
             f"{body.send_amount} {body.send_currency}" if body.send_amount else "your transfer"
         )
-        subject = f"Transfer receipt — {amt_line}"
+        subject = f"Transfer sent — {amt_line} to {body.recipient_name or '—'}"
+
+        # Delivery-specific extra row
+        extra_rows = []
+        if body.pickup_code:
+            extra_rows.append(("Pickup code", body.pickup_code))
+        if body.wave_ref:
+            extra_rows.append(("Wave reference", body.wave_ref))
+
+        detail_rows = [
+            ("Transfer amount", f"{body.send_amount} {body.send_currency}" if body.send_amount else "—"),
+            ("Fee", f"{body.fee} {body.send_currency}" if body.fee is not None else "—"),
+            ("Recipient gets", f"{body.received_amount} {body.recv_currency}" if body.received_amount else "—"),
+            ("Reference", (body.transaction_ref[:20] + "…" if len(body.transaction_ref) > 20 else body.transaction_ref) if body.transaction_ref else "—"),
+            *extra_rows,
+        ]
+        rows_html = ''.join(
+            f'<tr><td style="padding:8px 0;color:#6b7280;border-bottom:1px solid #f3f4f6">{lbl}</td>'
+            f'<td style="padding:8px 0;text-align:right;font-weight:600;border-bottom:1px solid #f3f4f6">{val}</td></tr>'
+            for lbl, val in detail_rows if val != "—"
+        )
+
+        pickup_banner = ""
+        if body.pickup_code:
+            pickup_banner = f"""
+            <div style="margin:24px 0;padding:16px;background:#FFFBEB;border:1px solid #FCD34D;border-radius:12px;">
+              <p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#92400E;text-transform:uppercase;letter-spacing:1px">Cash Pickup Code</p>
+              <p style="margin:0;font-family:'Courier New',monospace;font-size:32px;font-weight:800;color:#B45309;letter-spacing:6px">{body.pickup_code}</p>
+              <p style="margin:8px 0 0;font-size:13px;color:#92400E">Share this code with the recipient to collect the cash.</p>
+            </div>
+            """
+
         html = f"""
-        <div style="font-family:sans-serif;max-width:520px;margin:40px auto;padding:32px;
-                    border:1px solid #e5e7eb;border-radius:12px;">
-          <h2 style="color:#0A1628;margin-top:0;">Transfer Sent ✓</h2>
-          <p>Your transfer of <strong>{amt_line}</strong> to
-             <strong>{body.recipient_name or '—'}</strong> was successful.</p>
+        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:560px;margin:40px auto;padding:32px;background:#fff;border:1px solid #e5e7eb;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,0.05)">
+          <p style="margin:0 0 8px;font-size:12px;font-weight:700;letter-spacing:2px;color:#9CA3AF;text-transform:uppercase">Kalipeh Wallet</p>
+          <h2 style="color:#0A1628;margin:0 0 16px;font-size:26px;font-weight:800">Transfer Sent ✓</h2>
+          <p style="margin:0 0 24px;font-size:15px;color:#374151">Your transfer of <strong>{amt_line}</strong> to <strong>{body.recipient_name or '—'}</strong> was successful.</p>
           <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:16px;">
-            {''.join(f'<tr><td style="padding:8px 0;color:#6b7280;border-bottom:1px solid #f3f4f6">{lbl}</td>'
-                     f'<td style="padding:8px 0;text-align:right;font-weight:600;border-bottom:1px solid #f3f4f6">{val}</td></tr>'
-                     for lbl, val in [
-                         ("Fee",           f"{body.fee} {body.send_currency}" if body.fee is not None else "—"),
-                         ("Recipient gets",f"{body.received_amount} {body.recv_currency}" if body.received_amount else "—"),
-                         ("Reference",     body.transaction_ref[:20] + "…" if len(body.transaction_ref) > 20 else body.transaction_ref),
-                     ] if val != "—")}
+            {rows_html}
           </table>
+          {pickup_banner}
           <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
-          <p style="color:#9ca3af;font-size:12px;">KalipehWallet — automated receipt.</p>
+          <p style="color:#9ca3af;font-size:12px;margin:0">This is an automated transfer confirmation from Kalipeh Wallet.</p>
         </div>
         """
         await _send_with_config(smtp, user.email, subject, html)
 
-    return {"message": "Receipt email queued"}
+        return {"message": "Receipt email queued"}
+
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return {"message": "Receipt email queued (send failed)"}
 
 
 @router.post("/email/send")
@@ -264,45 +298,56 @@ async def send_email_endpoint(
     Accepts either a client-supplied smtp_config or falls back to the
     server-side SMTP configuration stored in the database / environment.
     """
-    # Prefer client-supplied SMTP config (sent by the app's receipt flow)
-    if body.smtp_config and body.smtp_config.get("host"):
-        smtp = body.smtp_config
-    else:
-        smtp = await resolve_smtp(db)
-
-    if not smtp.get("host") or not smtp.get("from_email"):
-        raise HTTPException(
-            400,
-            "SMTP not configured. Set SMTP_HOST / SMTP_FROM_EMAIL in .env "
-            "or configure via Profile → Settings → Email (SMTP).",
-        )
-
-    html_body = body.html or body.body or body.text
-    if not html_body:
-        raise HTTPException(400, "No email body provided (html / body / text)")
-
-    # Wrap plain text in minimal HTML if no tags present
-    if "<" not in html_body:
-        html_body = f"<p>{html_body.replace(chr(10), '<br>')}</p>"
-
     try:
-        await asyncio.to_thread(
-            _send_sync,
-            smtp["host"], int(smtp.get("port", 587)),
-            smtp.get("username", ""), smtp.get("password", ""),
-            smtp.get("from_email", ""), smtp.get("from_name", "Kalipeh Wallet"),
-            smtp.get("use_tls", True), smtp.get("use_ssl", False),
-            body.to, body.subject, html_body,
-        )
-    except smtplib.SMTPAuthenticationError:
-        raise HTTPException(400, "SMTP authentication failed — check username/password")
-    except smtplib.SMTPRecipientsRefused:
-        raise HTTPException(400, f"Recipient rejected: {body.to}")
-    except smtplib.SMTPException as e:
-        raise HTTPException(400, f"SMTP error: {e}")
-    except OSError as e:
-        raise HTTPException(400, f"Network error connecting to SMTP: {e}")
-    except Exception as e:
-        raise HTTPException(400, f"Failed to send email: {e}")
+        # Prefer client-supplied SMTP config (sent by the app's receipt flow)
+        if body.smtp_config and body.smtp_config.get("host"):
+            smtp = body.smtp_config
+        else:
+            smtp = await resolve_smtp(db)
 
-    return {"message": f"Email sent to {body.to}"}
+        if not smtp.get("host") or not smtp.get("from_email"):
+            raise HTTPException(
+                400,
+                "SMTP not configured. Set SMTP_HOST / SMTP_FROM_EMAIL in .env "
+                "or configure via Profile → Settings → Email (SMTP).",
+            )
+
+        if not smtp.get("enabled", True):
+            raise HTTPException(400, "SMTP is disabled in settings.")
+
+        html_body = body.html or body.body or body.text
+        if not html_body:
+            raise HTTPException(400, "No email body provided (html / body / text)")
+
+        # Wrap plain text in minimal HTML if no tags present
+        if "<" not in html_body:
+            html_body = f"<p>{html_body.replace(chr(10), '<br>')}</p>"
+
+        try:
+            await asyncio.to_thread(
+                _send_sync,
+                smtp["host"], int(smtp.get("port", 587)),
+                smtp.get("username", ""), smtp.get("password", ""),
+                smtp.get("from_email", ""), smtp.get("from_name", "Kalipeh Wallet"),
+                smtp.get("use_tls", True), smtp.get("use_ssl", False),
+                body.to, body.subject, html_body,
+            )
+        except smtplib.SMTPAuthenticationError:
+            raise HTTPException(400, "SMTP authentication failed — check username/password")
+        except smtplib.SMTPRecipientsRefused:
+            raise HTTPException(400, f"Recipient rejected: {body.to}")
+        except smtplib.SMTPException as e:
+            raise HTTPException(400, f"SMTP error: {e}")
+        except OSError as e:
+            raise HTTPException(400, f"Network error connecting to SMTP: {e}")
+        except Exception as e:
+            raise HTTPException(400, f"Failed to send email: {e}")
+
+        return {"message": f"Email sent to {body.to}"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Unexpected server error while sending email: {e}")
