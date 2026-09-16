@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 
 from config.database import connect_db, database_ready, disconnect_db
 from config.runtime import cors_origins, is_production, jwt_secret
-from handlers import admin, auth, cash, country, exchange, kyc, notification, payment, qr, recipient, transfer, user, wallet
+from handlers import admin, auth, cash, country, exchange, kyc, notification, payment, qr, recipient, topup, transfer, user, wallet, webhook
 from middleware.ratelimit import rate_limiter
 
 
@@ -75,6 +75,7 @@ prefix = "/api/v1"
 app.include_router(auth.router, prefix=prefix)
 app.include_router(user.router, prefix=prefix)
 app.include_router(wallet.router, prefix=prefix)
+app.include_router(topup.router, prefix=prefix)
 app.include_router(transfer.router, prefix=prefix)
 app.include_router(cash.router, prefix=prefix)
 app.include_router(qr.router, prefix=prefix)
@@ -85,6 +86,8 @@ app.include_router(exchange.router, prefix=prefix)
 app.include_router(country.router, prefix=prefix)
 app.include_router(payment.router, prefix=prefix)
 app.include_router(admin.router, prefix=prefix)
+# CRITICAL FIX: Webhook router includes full spec-compliant path, so exclude from v1 prefix
+app.include_router(webhook.router)
 
 
 if __name__ == "__main__":

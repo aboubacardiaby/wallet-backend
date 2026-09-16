@@ -63,7 +63,7 @@ _DEFAULT_SETTINGS: dict = {
     "max_transfer_amount":   10_000.0,
     "maintenance_mode":      False,
     "kyc_required":          False,
-    "support_email":         "support@kalipeh.com",
+    "support_email":         "aboudiaby@talenceinformatixs.com",
     "app_name":              "Kalipeh Wallet",
 }
 
@@ -188,28 +188,6 @@ async def admin_login(body: AdminLoginRequest, db: AsyncSession = Depends(get_db
         "role":         role,
         "username":     body.username,
         "expires_in":   43200,
-    }
-
-
-@router.get("/me")
-async def admin_me(
-    token: dict = Depends(verify_admin_token),
-    db: AsyncSession = Depends(get_db),
-):
-    username = token.get("sub")
-    db_user = await db.scalar(select(AdminUser).where(AdminUser.username == username))
-    if db_user:
-        return {
-            "username":  db_user.username,
-            "email":     db_user.email,
-            "role":      db_user.role,
-            "is_admin":  True,
-        }
-    return {
-        "username": username,
-        "email":    None,
-        "role":     token.get("role"),
-        "is_admin": True,
     }
 
 

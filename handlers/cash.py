@@ -11,6 +11,7 @@ from config.database import get_db
 from config.runtime import allow_simulated_funding
 from middleware.auth import verify_token
 from models.wallet import Agent, Transaction, Wallet
+from services.topup.agent_cash import apply_agent_cash_topup
 from services.wallet_policy import credit, debit
 from utils import row_to_dict
 
@@ -27,12 +28,37 @@ class CashOutRequest(BaseModel):
     amount: float
 
 
+class AgentCashTopUpRequest(BaseModel):
+    top_up_id: uuid_lib.UUID
+    confirmation_code: str
+
+
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
     return R * 2 * math.asin(math.sqrt(a))
+
+
+@router.post("/agents/top-ups")
+async def agent_cash_top_up(
+    req: AgentCashTopUpRequest,
+    token: dict = Depends(verify_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """Finalize a customer-approved agent cash top-up."""
+    try:
+        agent_user_id = uuid_lib.UUID(str(token.get("user_id")))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid authentication subject")
+    top_up = await apply_agent_cash_topup(
+        db, agent_user_id=agent_user_id, top_up_id=req.top_up_id,
+        confirmation_code=req.confirmation_code,
+    )
+    return {"top_up_id": str(top_up.id), "status": top_up.status,
+            "wallet_id": str(top_up.wallet_id), "amount": str(top_up.net_amount),
+            "currency": top_up.currency}
 
 
 @router.post("/cash/in")
