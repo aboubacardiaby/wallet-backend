@@ -73,8 +73,23 @@ PROVIDER_CLEARING_ACCOUNT = "provider_clearing"
 FEE_INCOME_ACCOUNT = "fee_income"
 
 TERMINAL_STATUSES = {"Completed", "Failed", "Expired", "Cancelled", "Reversed", "UnderReview"}
-COMPLETABLE_FROM = {"Processing"}
-FAILABLE_FROM = {"Processing", "RequiresAction"}
+# Terminal states in which a verified provider success means money arrived that was never
+# credited and never will be by this flow.
+UNCREDITABLE_TERMINAL_STATUSES = {"Cancelled", "Failed", "Expired"}
+# T034b: a real provider need not emit a Processing event before a terminal one
+# (a card payment can go straight to "succeeded"; Stripe does not guarantee event
+# order). A verified completion/failure for a Pending or RequiresAction top-up is
+# therefore accepted, and the intermediate Processing hop is applied inside the same
+# atomic transaction (see complete_verified_topup). The transition table itself is
+# unchanged. "Created" (never reached Pending) is still rejected.
+COMPLETABLE_FROM = {"Processing", "Pending", "RequiresAction"}
+FAILABLE_FROM = {"Processing", "RequiresAction", "Pending"}
+
+# Verified non-terminal provider events (apply_verified_progress) and the states each
+# may advance a top-up from. Any other non-terminal state means the event is repeated
+# or late and is ignored rather than moving the top-up backwards or sideways.
+PROGRESS_STATUSES = {"Processing", "RequiresAction"}
+_PROGRESS_FROM = {"Processing": {"Pending", "RequiresAction"}, "RequiresAction": {"Pending"}}
 
 
 class TopUpNotFoundError(LookupError):
@@ -92,7 +107,7 @@ class InvalidCompletionStateError(ValueError):
 @dataclass(frozen=True)
 class CompletionOutcome:
     top_up: TopUp
-    action: str  # "completed" | "under_review" | "failed" | "no_op"
+    action: str  # "completed" | "under_review" | "failed" | "progressed" | "attempt_failed_recorded" | "no_op"
     ledger_transaction: Optional[LedgerTransactionRecord] = None
 
 
@@ -175,12 +190,45 @@ async def complete_verified_topup(
             except Exception:
                 await db.rollback()
                 raise
+        elif top_up.status in UNCREDITABLE_TERMINAL_STATUSES:
+            # The provider says money arrived for a top-up we can no longer credit (it was
+            # cancelled, failed or expired first). It must not be credited silently, and it
+            # must not vanish either. The state stays terminal (no refund or reconciliation
+            # behavior is specified yet: spec.md [NEEDS CLARIFICATION]); the record below is
+            # what an operator, and later the reconciliation job (T023), can find.
+            logger.error(
+                "Verified provider success for %s top-up %s (provider reference %s): money "
+                "received for a top-up that cannot be credited; needs operator follow-up",
+                top_up.status, top_up.internal_reference, provider_transaction_reference,
+            )
+            try:
+                await log_audit(
+                    db,
+                    action="topup_late_success_on_terminal_top_up",
+                    resource_type="top_up",
+                    resource_id=str(top_up.id),
+                    details={
+                        "top_up_status": top_up.status,
+                        "reported_amount": str(reported_amount.amount),
+                        "reported_currency": reported_amount.currency,
+                        "provider_transaction_reference": provider_transaction_reference,
+                    },
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
         return CompletionOutcome(top_up=top_up, action="no_op")
 
     if top_up.status not in COMPLETABLE_FROM:
         raise InvalidCompletionStateError(
-            f"cannot complete verified top-up from state {top_up.status!r}; expected 'Processing'"
+            f"cannot complete verified top-up from state {top_up.status!r}; "
+            "expected 'Processing', 'Pending' or 'RequiresAction'"
         )
+    if top_up.status != "Processing":
+        # Implied provider acceptance (T034b). Any later failure below rolls this back
+        # together with everything else, so it is never persisted on its own.
+        top_up.status = transition(top_up.status, "Processing")
 
     now = datetime.now(timezone.utc)
     gross = Money(top_up.gross_amount, top_up.currency)
@@ -369,3 +417,88 @@ async def apply_verified_failure(
         await db.rollback()
         raise
     return CompletionOutcome(top_up=top_up, action="failed")
+
+
+async def apply_verified_progress(
+    db,
+    top_up_id: uuid.UUID,
+    new_status: str,
+) -> CompletionOutcome:
+    """Record a verified NON-terminal provider event (T034b).
+
+    Moves no money. Providers repeat and reorder events, so a move that would be
+    backwards or sideways (a late ``RequiresAction`` after ``Processing``, a repeated
+    ``Processing``, any event for an already-terminal top-up) is a quiet no-op, never
+    an error and never a regression. The row is locked so a concurrent terminal event
+    cannot be overwritten by a stale progress write.
+    """
+    if new_status not in PROGRESS_STATUSES:
+        raise ValueError(f"{new_status!r} is not a non-terminal provider progress status")
+
+    top_up = await db.scalar(select(TopUp).where(TopUp.id == top_up_id).with_for_update())
+    if top_up is None:
+        raise TopUpNotFoundError(f"no top-up with id {top_up_id}")
+
+    if top_up.status in TERMINAL_STATUSES:
+        return CompletionOutcome(top_up=top_up, action="no_op")
+    if top_up.status == "Created":
+        raise InvalidCompletionStateError(
+            f"cannot apply a verified provider event to top-up in state {top_up.status!r}"
+        )
+    if top_up.status not in _PROGRESS_FROM[new_status]:
+        return CompletionOutcome(top_up=top_up, action="no_op")
+
+    previous = top_up.status
+    try:
+        top_up.status = transition(top_up.status, new_status)
+        top_up.updated_at = datetime.now(timezone.utc)
+        await log_audit(
+            db,
+            action="topup_status_progressed",
+            resource_type="top_up",
+            resource_id=str(top_up.id),
+            details={"from": previous, "to": new_status},
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+    return CompletionOutcome(top_up=top_up, action="progressed")
+
+
+async def record_payment_attempt_failure(
+    db,
+    top_up_id: uuid.UUID,
+    failure_code: Optional[str],
+) -> CompletionOutcome:
+    """Record that one payment ATTEMPT failed (a declined card) without ending the top-up.
+
+    T034i (human decision 2026-09-19, option A). Providers such as Stripe report every failed
+    attempt while leaving the payment payable, so the customer can retry on the same payment.
+    Ending the top-up here made a successful retry arrive for a terminal `Failed` top-up: the
+    customer was charged and never credited. The top-up therefore keeps its state; the attempt
+    is only audited. A top-up ends as Failed only when the provider reports the payment
+    cancelled (apply_verified_failure), and moves no money here.
+    """
+    top_up = await db.scalar(select(TopUp).where(TopUp.id == top_up_id).with_for_update())
+    if top_up is None:
+        raise TopUpNotFoundError(f"no top-up with id {top_up_id}")
+    if top_up.status in TERMINAL_STATUSES:
+        return CompletionOutcome(top_up=top_up, action="no_op")
+    if top_up.status == "Created":
+        raise InvalidCompletionStateError(
+            f"cannot record a payment attempt for top-up in state {top_up.status!r}"
+        )
+    try:
+        await log_audit(
+            db,
+            action="topup_payment_attempt_failed",
+            resource_type="top_up",
+            resource_id=str(top_up.id),
+            details={"top_up_status": top_up.status, "failure_code": failure_code or "unknown"},
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+    return CompletionOutcome(top_up=top_up, action="attempt_failed_recorded")

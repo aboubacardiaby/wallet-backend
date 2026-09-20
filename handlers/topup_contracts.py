@@ -68,6 +68,7 @@ class ErrorCode(str, Enum):
     INVALID_STATE = "invalid_state"
     UNSUPPORTED_CURRENCY = "unsupported_currency"
     UNSUPPORTED_FUNDING_METHOD = "unsupported_funding_method"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
     INTERNAL_ERROR = "internal_error"
 
 
@@ -81,6 +82,7 @@ ERROR_STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.INVALID_STATE: 409,
     ErrorCode.UNSUPPORTED_CURRENCY: 422,
     ErrorCode.UNSUPPORTED_FUNDING_METHOD: 422,
+    ErrorCode.PROVIDER_UNAVAILABLE: 503,
     ErrorCode.INTERNAL_ERROR: 500,
 }
 
@@ -125,10 +127,19 @@ class InitiateTopUpHeaders(ContractModel):
 
 
 class NextAction(ContractModel):
-    type: Literal["none", "redirect", "display_instructions", "await_provider"]
+    type: Literal[
+        "none", "redirect", "display_instructions", "await_provider", "confirm_with_provider"
+    ]
     url: str | None = None
     instructions: str | None = Field(default=None, max_length=1000)
     expires_at: datetime | None = None
+    # confirm_with_provider (T034c): the customer's device completes the payment with the
+    # provider's own SDK (Stripe ``confirmPayment``) using ``client_secret``. That secret
+    # can complete a charge, so it appears ONLY on the initiation response (never on
+    # detail or history), is never stored, and is excluded from repr() to keep it out
+    # of logs. Clients must not log or persist it either.
+    provider: str | None = Field(default=None, max_length=80)
+    client_secret: str | None = Field(default=None, min_length=1, max_length=512, repr=False)
 
 
 class FundingSummary(ContractModel):

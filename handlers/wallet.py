@@ -20,7 +20,8 @@ async def get_balance(token: dict = Depends(verify_token), db: AsyncSession = De
     )
     if not wallet:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Wallet not found")
-    return row_to_dict(wallet, exclude=("id",))
+    # Exposed as wallet_id (not id) so the client can address /wallets/{walletId}/top-ups.
+    return {**row_to_dict(wallet, exclude=("id",)), "wallet_id": str(wallet.id)}
 
 
 @router.get("/wallet/transactions")

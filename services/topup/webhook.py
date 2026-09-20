@@ -18,6 +18,7 @@ Constitutional compliance:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -36,10 +37,14 @@ from services.topup.completion import (
     TopUpNotFoundError,
     WalletNotFoundError,
     apply_verified_failure,
+    apply_verified_progress,
     complete_verified_topup,
+    record_payment_attempt_failure,
 )
 from services.topup.money import Money
 from services.topup.provider import (
+    ATTEMPT_FAILED,
+    IgnoredWebhookEventError,
     InvalidWebhookPayloadError,
     PaymentProvider,
     WebhookEvent,
@@ -169,6 +174,41 @@ async def _store_provider_event(
     return event
 
 
+async def _cancel_provider_payment_after_failure(db: AsyncSession, provider: PaymentProvider, top_up: TopUp) -> None:
+    """Best-effort: cancel a bank payment whose top-up has just durably become Failed.
+
+    Runs strictly AFTER the failure is committed, so a provider outage can never undo it. If
+    the payment cannot be cancelled it stays payable at the provider; that is recorded so an
+    operator can act, and a later verified success would be flagged by the late-success
+    audit (topup_late_success_on_terminal_top_up) instead of being silently ignored.
+    """
+    reference = top_up.provider_transaction_reference
+    try:
+        await asyncio.to_thread(provider.cancel, reference)
+        return
+    except Exception as exc:  # noqa: BLE001 - any failure must be recorded, never raised
+        error_name = type(exc).__name__
+        logger.error(
+            "Top-up %s failed but its provider payment %s could not be cancelled (%s)",
+            top_up.internal_reference, reference, error_name,
+        )
+    try:
+        await log_audit(
+            db,
+            action="topup_provider_cancel_failed",
+            resource_type="top_up",
+            resource_id=str(top_up.id),
+            details={"provider_transaction_reference": reference, "error": error_name},
+        )
+        await db.commit()
+    except Exception:
+        logger.exception("Failed to record the provider-cancel failure for top-up %s", top_up.id)
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception("Failed to roll back after the provider-cancel audit failed")
+
+
 async def process_webhook(
     db: AsyncSession,
     provider: PaymentProvider,
@@ -207,6 +247,16 @@ async def process_webhook(
             "status": "verification_failed",
             "error": str(exc),
             "error_type": "verification_error",
+            "provider_event_id": None,
+        }
+    except IgnoredWebhookEventError as exc:
+        # T034b: authentic, but not an event this integration acts on. Nothing is
+        # stored and no state changes; the route acknowledges it with 2xx because a
+        # retrying provider would otherwise redeliver it for days.
+        logger.info(f"Ignoring authentic webhook for provider {provider_name}: {exc}")
+        return {
+            "status": "ignored_event",
+            "error_type": None,
             "provider_event_id": None,
         }
     except InvalidWebhookPayloadError as exc:
@@ -342,11 +392,12 @@ async def process_webhook(
             stored_event.processing_status = "processed"
             stored_event.processed_at = datetime.now(timezone.utc)
 
-            # Call failure service for verified failure
+            # Call failure service for verified failure. The provider's own (sanitized) code is
+            # kept when it gave one, e.g. payment_canceled_abandoned (T034i).
             outcome = await apply_verified_failure(
                 db,
                 top_up.id,
-                failure_code="provider_failed",
+                failure_code=webhook_event.failure_code or "provider_failed",
                 failure_message="Provider reported payment failure",
             )
 
@@ -361,18 +412,71 @@ async def process_webhook(
                 "top_up_status": top_up.status,
             }
 
-        else:
-            # Other statuses (Processing, RequiresAction) - just log and acknowledge
-            # CRITICAL FIX: Mark event as processed in same transaction for consistency
+        elif webhook_event.status == ATTEMPT_FAILED:
+            # T034i (human decision 2026-09-19, option A): one payment ATTEMPT failed (a declined
+            # card) but the payment stays payable, so the top-up is NOT ended. Recording it
+            # only audits the attempt. Same atomicity rule as above: the event is marked
+            # processed first so it shares record_payment_attempt_failure()'s own commit.
             stored_event.processing_status = "processed"
             stored_event.processed_at = datetime.now(timezone.utc)
+
+            if top_up.funding_method == "bank_transfer":
+                # T034d (human decision 2026-09-19): for a bank (ACH) top-up a failed debit is not
+                # an instant retry (it can arrive days later, and trying again needs a fresh
+                # authorization), so it ENDS the top-up as Failed and the provider payment is
+                # cancelled so it can no longer be paid. Cards keep the attempt rule below.
+                outcome = await apply_verified_failure(
+                    db,
+                    top_up.id,
+                    failure_code=webhook_event.failure_code or "provider_failed",
+                    failure_message="Provider reported payment failure",
+                )
+                # Safety net only, as above.
+                await db.commit()
+                if outcome.action == "failed":
+                    await _cancel_provider_payment_after_failure(db, provider, top_up)
+                return {
+                    "status": "success",
+                    "provider_event_id": webhook_event.provider_event_id,
+                    "top_up_id": str(top_up.id),
+                    "action": outcome.action,
+                    "top_up_status": top_up.status,
+                }
+
+            outcome = await record_payment_attempt_failure(db, top_up.id, webhook_event.failure_code)
+
+            # Safety net only, as above: the no-op path performs no commit of its own.
             await db.commit()
 
             return {
                 "status": "acknowledged",
                 "provider_event_id": webhook_event.provider_event_id,
                 "top_up_id": str(top_up.id),
-                "action": "status_update_only",
+                "action": outcome.action,
+                "provider_status": webhook_event.status,
+            }
+
+        else:
+            # Non-terminal statuses (Processing, RequiresAction) -- T034b.
+            # These used to be acknowledged without touching the top-up, so a later
+            # verified success found it still Pending and failed with an illegal
+            # transition. Now they advance it via apply_verified_progress(), which
+            # moves no money and treats repeated/late events as no-ops. Same
+            # atomicity rule as the branches above: mark the event processed
+            # first so it rides along inside apply_verified_progress()'s own commit.
+            stored_event.processing_status = "processed"
+            stored_event.processed_at = datetime.now(timezone.utc)
+
+            outcome = await apply_verified_progress(db, top_up.id, webhook_event.status)
+
+            # Safety net only, as above: the no-op paths perform no commit of their own.
+            await db.commit()
+
+            return {
+                "status": "acknowledged",
+                "provider_event_id": webhook_event.provider_event_id,
+                "top_up_id": str(top_up.id),
+                "action": outcome.action,
                 "provider_status": webhook_event.status,
             }
 
